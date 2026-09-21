@@ -1,0 +1,129 @@
+#!/bin/bash
+# `omarchy plugin add` only clones files — by design it never runs package
+# managers or sudo. This script is the rest of the install: fan2go, liquidctl,
+# a polkit helper, and the fan2go service. Run it yourself, or press
+# "Install dependencies" in the widget panel (which runs exactly this in a
+# floating terminal).
+
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+USER_NAME="${SUDO_USER:-$USER}"
+USER_HOME="$(getent passwd "$USER_NAME" | cut -d: -f6)"
+CONFIG_DIR="$USER_HOME/.config/omaflow"
+HELPER_SRC="$HERE/scripts/omaflow_helper.py"
+HELPER_DST="/usr/local/lib/omaflow/omaflow-helper"
+POLICY_DST="/usr/share/polkit-1/actions/org.omarchy.omaflow.helper.policy"
+RULE_DST="/etc/polkit-1/rules.d/50-omaflow.rules"
+UNIT_DST="/etc/systemd/system/fan2go.service"
+
+echo "OmaFlow setup"
+echo "-------------"
+echo
+
+echo "Installing liquidctl…"
+omarchy-pkg-add liquidctl
+
+echo
+if ! command -v fan2go >/dev/null 2>&1; then
+  echo "Installing fan2go from the AUR…"
+  if omarchy-pkg-aur-add fan2go-git 2>/dev/null || omarchy-pkg-aur-add fan2go 2>/dev/null; then
+    echo "fan2go installed."
+  else
+    echo "Could not install fan2go automatically. Chassis fans still work through"
+    echo "the helper once this script finishes; you can install fan2go later with:"
+    echo "  omarchy pkg aur add fan2go-git"
+  fi
+else
+  echo "fan2go already present."
+fi
+
+echo
+echo "Installing the privileged helper (sudo)…"
+sudo mkdir -p /usr/local/lib/omaflow /etc/fan2go /etc/polkit-1/rules.d /var/lib/omaflow
+sudo install -m 0755 "$HELPER_SRC" "$HELPER_DST"
+# Shebang is python3; keep the file executable.
+sudo tee "$POLICY_DST" >/dev/null <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>OmaFlow</vendor>
+  <vendor_url>https://github.com/tempest-chaoscreator/OmaFlow</vendor_url>
+  <action id="org.omarchy.omaflow.helper">
+    <description>OmaFlow cooling helper</description>
+    <message>OmaFlow wants to apply fan and pump curves</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/lib/omaflow/omaflow-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+</policyconfig>
+EOF
+
+sudo tee "$RULE_DST" >/dev/null <<'EOF'
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.omarchy.omaflow.helper" &&
+        subject.isInGroup("wheel")) {
+        return polkit.Result.YES;
+    }
+});
+EOF
+
+sudo mkdir -p "$(dirname "$UNIT_DST")"
+sudo tee "$UNIT_DST" >/dev/null <<EOF
+[Unit]
+Description=fan2go (OmaFlow)
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/fan2go -c $CONFIG_DIR/fan2go.yaml
+Restart=on-failure
+RestartSec=3
+TimeoutStartSec=180
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+install -d -m 0755 "$CONFIG_DIR"
+if [ "$(id -u)" -eq 0 ]; then
+  chown -R "$USER_NAME":"$USER_NAME" "$CONFIG_DIR" || true
+fi
+
+# liquidctl ships udev rules; reload so the AIO is reachable without a replug.
+if command -v udevadm >/dev/null 2>&1; then
+  sudo udevadm control --reload-rules || true
+  sudo udevadm trigger || true
+fi
+
+if command -v fan2go >/dev/null 2>&1; then
+  if [ ! -f "$CONFIG_DIR/fan2go.yaml" ]; then
+    cat > "$CONFIG_DIR/fan2go.yaml" <<'YML'
+# Placeholder until OmaFlow writes a real config on first apply.
+dbPath: /tmp/fan2go-omaflow.db
+api:
+  enabled: true
+  host: 127.0.0.1
+  port: 9001
+sensors: []
+curves: []
+fans: []
+YML
+    chown "$USER_NAME":"$USER_NAME" "$CONFIG_DIR/fan2go.yaml" 2>/dev/null || true
+  fi
+  sudo systemctl daemon-reload
+  sudo systemctl enable --now fan2go.service || sudo systemctl restart fan2go.service || true
+fi
+
+echo
+echo "OmaFlow setup is done."
+echo "  liquidctl status     — AIO telemetry"
+echo "  fan2go detect        — chassis / GPU fans (if installed)"
+echo
+echo "The bar widget applies Silent on first use. Open it to edit curves."

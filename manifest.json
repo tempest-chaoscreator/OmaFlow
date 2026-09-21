@@ -1,0 +1,61 @@
+{
+  "schemaVersion": 1,
+  "id": "tempest-chaoscreator.omaflow",
+  "name": "OmaFlow",
+  "version": "1.0.0",
+  "author": "Tempest",
+  "license": "MIT",
+  "homepage": "https://github.com/tempest-chaoscreator/OmaFlow",
+  "description": "Air and liquid cooling from the Omarchy bar. Four locked cooling modes plus a custom NZXT-CAM-style curve, CPU/GPU telemetry, and Kraken LCD theming.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "OmaFlow",
+    "description": "CPU and GPU temps in the bar, with fan, pump, and AIO curves in a details panel.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "themeSync": true,
+      "lcdMode": "liquid",
+      "gpuControl": false,
+      "aioFanControl": false
+    },
+    "schema": [
+      {
+        "key": "gpuControl",
+        "type": "boolean",
+        "label": "Control GPU fans",
+        "description": "Off (default): the NVIDIA driver keeps its own fan curve. On: OmaFlow drives the GPU fans with the selected mode.",
+        "defaultValue": false
+      },
+      {
+        "key": "aioFanControl",
+        "type": "boolean",
+        "label": "Control AIO radiator fans",
+        "description": "Off (default): leave AIO fan headers alone — use this if those fans are on a hub or motherboard header. On: push the AIO fan curve through liquidctl.",
+        "defaultValue": false
+      },
+      {
+        "key": "themeSync",
+        "type": "boolean",
+        "label": "Sync AIO display with the theme accent",
+        "description": "Tint the AIO LCD and LEDs with the Omarchy accent. Liquid temp is redrawn in that color because the stock firmware display is white and not tintable.",
+        "defaultValue": true
+      },
+      {
+        "key": "lcdMode",
+        "type": "string",
+        "label": "Pump display",
+        "description": "Kraken LCD mode. Liquid shows coolant temperature. Accent paints the theme color. Off blanks the screen.",
+        "defaultValue": "liquid"
+      }
+    ]
+  }
+}
