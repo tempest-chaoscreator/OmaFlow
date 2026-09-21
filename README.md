@@ -1,4 +1,4 @@
-# OmaFlow (`tempest-chaoscreator.omaflow`)
+# OmaFlow
 
 Fan, pump, and AIO control from the [Omarchy](https://omarchy.org/) bar. Chassis fans through [fan2go](https://github.com/markusressel/fan2go), NVIDIA GPU fans through `nvidia-settings` (off until you enable them), AIO pump / radiator / LCD through [liquidctl](https://github.com/liquidctl/liquidctl). Same modes on both tabs, no separate panel for the pump.
 
