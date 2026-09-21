@@ -138,25 +138,26 @@ PRESETS = {
         # while Silent still says 0%.
         "gpu": _fill([0, 0, 0, 30, 32, 34, 37, 41, 46, 52, 60, 68, 76, 84, 91]),
         "aio": _fill([29, 29, 31, 33, 35, 37, 41, 45, 49, 53, 57, 61, 65, 69, 73]),
-        "pump": _fill([61, 61, 61, 61, 61, 63, 65, 67, 69, 71, 73, 75, 77, 79, 81]),
+        "pump": _fill([50, 50, 50, 50, 50, 50, 57, 64, 71, 79, 86, 93, 100, 100, 100]),
     },
     "static": {
-        "chassis": _flat(40),
-        "gpu": _flat(40),
-        "aio": _flat(40),
-        "pump": _flat(50),
+        "chassis": _flat(50),
+        "gpu": _flat(50),
+        "aio": _flat(50),
+        "pump": _flat(60),
     },
     "performance": {
         "chassis": _fill([22, 24, 28, 34, 42, 52, 62, 72, 82, 90, 96, 100, 100, 100, 100]),
         "gpu": _fill([20, 22, 26, 32, 40, 50, 60, 70, 80, 88, 94, 100, 100, 100, 100]),
         "aio": _fill([22, 24, 28, 34, 42, 52, 62, 72, 82, 90, 96, 100, 100, 100, 100]),
-        "pump": _fill([50, 50, 52, 55, 58, 62, 68, 74, 80, 85, 90, 94, 96, 98, 100]),
+        "pump": _fill([75, 75, 75, 75, 75, 75, 75, 81, 88, 94, 100, 100, 100, 100, 100]),
     },
     "hell": {
         "chassis": _fill([45, 48, 52, 58, 65, 72, 80, 88, 95, 100, 100, 100, 100, 100, 100]),
         "gpu": _fill([40, 44, 50, 56, 64, 72, 80, 88, 94, 100, 100, 100, 100, 100, 100]),
         "aio": _fill([45, 48, 52, 58, 65, 72, 80, 88, 95, 100, 100, 100, 100, 100, 100]),
-        "pump": _fill([60, 62, 65, 70, 75, 80, 85, 90, 94, 98, 100, 100, 100, 100, 100]),
+        # 75% until 40 °C, then one step to 100% at 45 °C.
+        "pump": _fill([75, 75, 75, 75, 75, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100]),
     },
 }
 
@@ -189,7 +190,7 @@ def apply_monotonic(points, index, value, minimum=0):
     for j in range(index - 1, -1, -1):
         if pts[j] > v:
             pts[j] = v
-    return pts
+    return enforce_min(pts, minimum)
 
 
 def duty_at(points, temp):
@@ -226,6 +227,7 @@ def default_state():
         "lcdBrightness": 80,
         "themeSync": True,
         "accent": "",
+        "pumpSensor": "cpu",
     }
 
 
@@ -770,6 +772,12 @@ def liquidctl_profile(channel: str, points, minimum: int) -> bool:
     return r is not None and r.returncode == 0
 
 
+def liquidctl_fixed_speed(channel: str, percent: int) -> bool:
+    pct = int(clamp(percent, 0, 100))
+    r = liquidctl_cmd("--match", "kraken", "set", channel, "speed", str(pct), timeout=12)
+    return r is not None and r.returncode == 0
+
+
 class OmaFlow:
     def __init__(self):
         self.lock = threading.RLock()
@@ -800,6 +808,7 @@ class OmaFlow:
         self._lcd_busy = False
         self._last_pwm = {}
         self._last_gpu_duty = None
+        self._last_pump_duty = None
         self._nvidia_manual = False
         self._curve_rev = 0
         self._liquidctl_inited = False
@@ -851,6 +860,8 @@ class OmaFlow:
             base["themeSync"] = bool(data["themeSync"])
         if data.get("accent"):
             base["accent"] = str(data["accent"])
+        if data.get("pumpSensor") in ("cpu", "liquid"):
+            base["pumpSensor"] = data["pumpSensor"]
         # Replace factory curves the user has not edited.
         old_factory = {
             "silent": {
@@ -884,6 +895,25 @@ class OmaFlow:
         old_silent_gpu_v3 = [0, 0, 0, 0, 0, 0, 0, 0, 31, 41, 53, 65, 75, 83, 91]
         if copy_points(base["curves"]["silent"]["gpu"]) == copy_points(old_silent_gpu_v3):
             base["curves"]["silent"]["gpu"] = list(PRESETS["silent"]["gpu"])
+        old_pumps = {
+            "silent": [
+                [50, 50, 50, 50, 50, 52, 54, 56, 58, 60, 62, 64, 66, 68, 70],
+                [58, 58, 58, 58, 58, 60, 62, 64, 66, 68, 70, 72, 74, 76, 78],
+                [61, 61, 61, 61, 61, 63, 65, 67, 69, 71, 73, 75, 77, 79, 81],
+            ],
+            "static": [[50] * POINT_COUNT],
+            "performance": [[50, 50, 52, 55, 58, 62, 68, 74, 80, 85, 90, 94, 96, 98, 100]],
+            "hell": [[60, 62, 65, 70, 75, 80, 85, 90, 94, 98, 100, 100, 100, 100, 100]],
+        }
+        for mode, olds in old_pumps.items():
+            cur = copy_points(base["curves"][mode]["pump"], PUMP_MIN)
+            if any(cur == copy_points(old, PUMP_MIN) for old in olds):
+                base["curves"][mode]["pump"] = list(PRESETS[mode]["pump"])
+        if copy_points(base["curves"]["custom"]["pump"], PUMP_MIN) == copy_points(old_pumps["performance"][0], PUMP_MIN):
+            base["curves"]["custom"]["pump"] = list(PRESETS["performance"]["pump"])
+        for ch in ("chassis", "gpu", "aio"):
+            if copy_points(base["curves"]["static"][ch]) in ([25] * POINT_COUNT, [40] * POINT_COUNT):
+                base["curves"]["static"][ch] = list(PRESETS["static"][ch])
         self.state = base
 
     def _save_now(self) -> None:
@@ -1000,6 +1030,7 @@ class OmaFlow:
             self.tick_control()
         else:
             self.tick_gpu()
+        self.tick_pump()
 
     def tick_gpu(self) -> None:
         if not self.state.get("gpuControl"):
@@ -1027,6 +1058,23 @@ class OmaFlow:
         if set_nvidia_fan(duty):
             self._last_gpu_duty = duty
             self._nvidia_manual = True
+
+    def tick_pump(self) -> None:
+        if not self.liquidctl_installed:
+            return
+        if self.state.get("pumpSensor", "cpu") != "cpu":
+            return
+        cpu = self.temps.get("cpu")
+        if cpu is None:
+            return
+        mode = self.state["mode"]
+        duty = int(round(duty_at(self.state["curves"][mode]["pump"], cpu)))
+        duty = max(PUMP_MIN, min(100, duty))
+        last = self._last_pump_duty
+        if last is not None and abs(duty - last) < 3:
+            return
+        if liquidctl_fixed_speed("pump", duty):
+            self._last_pump_duty = duty
 
     def tick_control(self) -> None:
         mode = self.state["mode"]
@@ -1070,8 +1118,9 @@ class OmaFlow:
             if not self._liquidctl_inited:
                 liquidctl_cmd("initialize", "all")
                 self._liquidctl_inited = True
-            if not liquidctl_profile("pump", curves["pump"], PUMP_MIN):
-                errors.append("AIO pump curve failed")
+            if self.state.get("pumpSensor", "cpu") == "liquid":
+                if not liquidctl_profile("pump", curves["pump"], PUMP_MIN):
+                    errors.append("AIO pump curve failed")
             if self.state.get("aioFanControl"):
                 if not liquidctl_profile("fan", curves["aio"], FAN_MIN if mode != "silent" else 0):
                     errors.append("AIO fan curve failed")
@@ -1088,6 +1137,7 @@ class OmaFlow:
             self.tick_control()
         else:
             self.tick_gpu()
+        self.tick_pump()
 
         self.apply_error = "; ".join(errors)
         if self.apply_error:
@@ -1213,6 +1263,7 @@ class OmaFlow:
             "presetsLocked": self.state.get("presetsLocked", True) is not False,
             "gpuControl": self.state.get("gpuControl") is True,
             "aioFanControl": self.state.get("aioFanControl") is True,
+            "pumpSensor": self.state.get("pumpSensor") or "cpu",
             "locked": self.is_locked(),
             "selectedChannel": self.state["selectedChannel"],
             "temps": self.temps,
@@ -1288,6 +1339,15 @@ class OmaFlow:
             self.save_state()
             self.schedule_apply()
             self.emit_state()
+            return
+        if op == "set_pump_sensor":
+            sensor = str(msg.get("sensor") or "")
+            if sensor in ("cpu", "liquid"):
+                self.state["pumpSensor"] = sensor
+                self._last_pump_duty = None
+                self.save_state()
+                self.schedule_apply()
+                self.emit_state()
             return
         if op == "set_aio_fan_control":
             self.state["aioFanControl"] = bool(msg.get("enabled", False))
@@ -1410,8 +1470,12 @@ def main() -> None:
                 if "gpu_fan" in existing:
                     app.schedule_apply()
             if app.liquidctl_installed:
-                curves = app.state["curves"][app.state["mode"]]
-                if liquidctl_profile("pump", curves["pump"], PUMP_MIN):
+                if app.state.get("pumpSensor", "cpu") == "liquid":
+                    curves = app.state["curves"][app.state["mode"]]
+                    if liquidctl_profile("pump", curves["pump"], PUMP_MIN):
+                        app.apply_error = ""
+                else:
+                    app.tick_pump()
                     app.apply_error = ""
             app.emit_state()
         except Exception:

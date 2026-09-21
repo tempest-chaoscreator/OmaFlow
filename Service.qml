@@ -21,6 +21,7 @@ Item {
   property bool presetsLocked: true
   property bool gpuControl: false
   property bool aioFanControl: false
+  property string pumpSensor: "cpu"
   property bool locked: true
   property var curves: ({})
   property string selectedChannel: "chassis"
@@ -82,6 +83,7 @@ Item {
     presetsLocked = msg.presetsLocked !== false
     gpuControl = msg.gpuControl === true
     aioFanControl = msg.aioFanControl === true
+    if (msg.pumpSensor === "liquid" || msg.pumpSensor === "cpu") pumpSensor = msg.pumpSensor
     locked = msg.locked === true
     curves = msg.curves || curves
     selectedChannel = String(msg.selectedChannel || selectedChannel)
@@ -107,6 +109,7 @@ Item {
   function setPresetsLocked(lockedFlag) { send({ op: "set_presets_locked", locked: lockedFlag === true }) }
   function setGpuControl(on) { send({ op: "set_gpu_control", enabled: on === true }) }
   function setAioFanControl(on) { send({ op: "set_aio_fan_control", enabled: on === true }) }
+  function setPumpSensor(id) { send({ op: "set_pump_sensor", sensor: String(id) }) }
   function setChannel(id) { send({ op: "set_channel", channel: String(id) }) }
   function setPoint(index, value, curveMode) {
     send({ op: "set_point", mode: String(curveMode || mode), channel: selectedChannel, index: index, value: value })

@@ -95,12 +95,14 @@ function channelMin(id) {
   return String(id) === "pump" ? PUMP_MIN : 0
 }
 
-function copyPoints(points) {
+function copyPoints(points, minDuty) {
+  var lo = minDuty === undefined ? 0 : Number(minDuty)
+  if (!isFinite(lo)) lo = 0
   var out = []
   var src = Array.isArray(points) ? points : []
   for (var i = 0; i < POINT_COUNT; i++) {
-    var v = i < src.length ? Number(src[i]) : 0
-    out.push(clamp(isFinite(v) ? v : 0, 0, 100))
+    var v = i < src.length ? Number(src[i]) : lo
+    out.push(clamp(isFinite(v) ? v : lo, lo, 100))
   }
   return out
 }
@@ -111,7 +113,7 @@ function copyPoints(points) {
 function applyMonotonic(points, index, value, minDuty) {
   var lo = minDuty === undefined ? 0 : Number(minDuty)
   if (!isFinite(lo)) lo = 0
-  var pts = copyPoints(points)
+  var pts = copyPoints(points, lo)
   var i = Math.round(Number(index))
   if (!(i >= 0 && i < POINT_COUNT)) return pts
   var v = clamp(value, lo, 100)
@@ -122,6 +124,9 @@ function applyMonotonic(points, index, value, minDuty) {
   }
   for (j = i - 1; j >= 0; j--) {
     if (pts[j] > v) pts[j] = v
+  }
+  for (j = 0; j < POINT_COUNT; j++) {
+    if (pts[j] < lo) pts[j] = lo
   }
   return pts
 }

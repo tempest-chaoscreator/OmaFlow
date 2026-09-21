@@ -31,14 +31,14 @@ Item {
   property int dragIndex: -1
 
   function syncLive() {
-    livePoints = Model.copyPoints(points)
+    livePoints = Model.copyPoints(points, minDuty)
   }
 
   function dutyAt(i) {
     var pts = (livePoints && livePoints.length) ? livePoints : (points || [])
-    var v = (i >= 0 && i < pts.length) ? Number(pts[i]) : 0
-    if (!isFinite(v)) v = 0
-    return Math.max(0, Math.min(100, v))
+    var v = (i >= 0 && i < pts.length) ? Number(pts[i]) : minDuty
+    if (!isFinite(v)) v = minDuty
+    return Math.max(minDuty, Math.min(100, v))
   }
 
   function xAt(i) {
@@ -66,6 +66,10 @@ Item {
   onForegroundChanged: canvas.requestPaint()
   onWidthChanged: canvas.requestPaint()
   onHeightChanged: canvas.requestPaint()
+  onMinDutyChanged: {
+    if (dragIndex < 0) syncLive()
+    canvas.requestPaint()
+  }
 
   Canvas {
     id: canvas
@@ -91,14 +95,27 @@ Item {
         ctx.stroke()
       }
 
-      var pts = root.points || []
+      if (root.minDuty > 0) {
+        var yFloor = root.yAt(root.minDuty)
+        var yZero = root.yAt(0)
+        ctx.fillStyle = Qt.rgba(fg.r, fg.g, fg.b, 0.08)
+        ctx.fillRect(root.padL, yFloor, root.plotW, Math.max(0, yZero - yFloor))
+        ctx.beginPath()
+        ctx.moveTo(root.padL, yFloor)
+        ctx.lineTo(root.width - root.padR, yFloor)
+        ctx.strokeStyle = Qt.rgba(fg.r, fg.g, fg.b, 0.35)
+        ctx.stroke()
+      }
+
+      var pts = root.livePoints && root.livePoints.length ? root.livePoints : (root.points || [])
       if (pts.length >= 2) {
+        var floorY = root.yAt(root.minDuty)
         ctx.beginPath()
         ctx.moveTo(root.xAt(0), root.yAt(root.dutyAt(0)))
         for (var i = 1; i < root.n; i++)
           ctx.lineTo(root.xAt(i), root.yAt(root.dutyAt(i)))
-        ctx.lineTo(root.xAt(root.n - 1), root.yAt(0))
-        ctx.lineTo(root.xAt(0), root.yAt(0))
+        ctx.lineTo(root.xAt(root.n - 1), floorY)
+        ctx.lineTo(root.xAt(0), floorY)
         ctx.closePath()
         ctx.fillStyle = Qt.rgba(ac.r, ac.g, ac.b, 0.18)
         ctx.fill()

@@ -22,6 +22,7 @@ Panel {
   readonly property bool presetsLocked: service ? service.presetsLocked !== false : true
   readonly property bool gpuControl: service ? service.gpuControl === true : false
   readonly property bool aioFanControl: service ? service.aioFanControl === true : false
+  readonly property string pumpSensor: service && service.pumpSensor === "liquid" ? "liquid" : "cpu"
   readonly property bool curveLocked: service ? service.locked === true : true
   readonly property bool channelLive: Model.channelEnabled(selectedChannel, gpuControl, aioFanControl)
   readonly property var curves: service && service.curves ? service.curves : ({})
@@ -90,13 +91,20 @@ Panel {
     var rev = service ? service.curveRev : 0
     var all = curves[viewMode]
     if (!all) return []
-    return Model.copyPoints(all[selectedChannel] || [])
+    return Model.copyPoints(all[selectedChannel] || [], Model.channelMin(selectedChannel))
   }
   readonly property real channelTemp: {
     if (selectedChannel === "gpu") return Number(temps.gpu)
-    if (selectedChannel === "aio" || selectedChannel === "pump") return Number(temps.coolant)
+    if (selectedChannel === "aio") return Number(temps.coolant)
+    if (selectedChannel === "pump")
+      return pumpSensor === "liquid" ? Number(temps.coolant) : Number(temps.cpu)
     return Number(temps.cpu)
   }
+
+  readonly property var pumpSensorOptions: [
+    { value: "cpu", label: "CPU temp" },
+    { value: "liquid", label: "Liquid temp" }
+  ]
   readonly property int channelMin: Model.channelMin(selectedChannel)
   readonly property var chassisFan: Model.firstFan(fans, "chassis")
   readonly property var aioFan: Model.firstFan(fans, "aio")
@@ -768,10 +776,37 @@ Panel {
               width: parent.width
               text: Model.channelLabel(root.selectedChannel) + "  ·  " + Model.modeLabel(root.viewMode)
                     + (isFinite(root.channelTemp) ? "  ·  now " + Model.formatTemp(root.channelTemp) : "")
-                    + (root.selectedChannel === "pump" ? "  ·  floor 50%" : "")
+                    + (root.selectedChannel === "pump"
+                      ? (root.pumpSensor === "liquid" ? "  ·  liquid" : "  ·  CPU") + "  ·  floor 50%"
+                      : "")
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
+            }
+
+            Row {
+              visible: root.selectedChannel === "pump"
+              width: parent.width
+              spacing: Style.space(8)
+
+              Text {
+                text: "Curve input"
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                anchors.verticalCenter: parent.verticalCenter
+              }
+
+              ButtonGroup {
+                options: root.pumpSensorOptions
+                value: root.pumpSensor
+                foreground: root.fg
+                accent: root.accent
+                fontFamily: root.fontFamily
+                fontSize: Style.font.caption
+                focusable: false
+                onChanged: function(v) { if (root.service) root.service.setPumpSensor(v) }
+              }
             }
 
             PanelSeparator { foreground: root.fg }

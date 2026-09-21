@@ -153,7 +153,7 @@ GPU and AIO stay unmanaged until you enable their toggles.
 | **Hell** | High floor, stays aggressive | 60% floor, holds the steep curve |
 | **Custom** | Yours | Yours (still 50% minimum) |
 
-Pump duty never goes below 50% in any mode.
+Pump duty never goes below 50% in any mode, including Custom — dragging a pump handle below that floor snaps it back.
 
 AIO LCD:
 
