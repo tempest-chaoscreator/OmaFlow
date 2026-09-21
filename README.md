@@ -1,6 +1,6 @@
 # OmaFlow (`tempest-chaoscreator.omaflow`)
 
-Fan, pump, and AIO control from the [Omarchy](https://omarchy.org/) bar. Chassis fans through [fan2go](https://github.com/markusressel/fan2go), NVIDIA GPU fans through `nvidia-settings` (off until you enable them), AIO pump / radiator / LCD through [liquidctl](https://github.com/liquidctl/liquidctl). Same modes on both tabs — no separate panel for the pump.
+Fan, pump, and AIO control from the [Omarchy](https://omarchy.org/) bar. Chassis fans through [fan2go](https://github.com/markusressel/fan2go), NVIDIA GPU fans through `nvidia-settings` (off until you enable them), AIO pump / radiator / LCD through [liquidctl](https://github.com/liquidctl/liquidctl). Same modes on both tabs, no separate panel for the pump.
 
 ![OmaFlow telemetry](screenshots/telemetry.png)
 
@@ -141,7 +141,7 @@ That deletes the plugin folder and its bar entry. fan2go and liquidctl stay inst
 
 **Telemetry** — CPU (Tctl + CCDs), GPU (temp, load, power, fan), coolant, pump, chassis RPM, one-minute sparkline.
 
-**Curves** — five modes and an NZXT CAM-style graph (15 temperature columns, 20–90 °C). Drag a handle up and the points to its right come with it. Silent / Static / Performance / Hell share one padlock. Custom is always unlocked. Reset restores only the selected channel (Chassis, Pump, AIO, or GPU). Edits on this tab do not change the live mode — pick that on Telemetry.
+**Curves** — five modes and an NZXT CAM-style graph (15 temperature columns, 20–90 °C). Drag a handle up and the points to its right come with it. Silent / Static / Performance / Hell share one padlock. Custom is always unlocked. Reset restores only the selected channel (Chassis, Pump, AIO, or GPU). Edits on this tab do not change the live mode, pick that on Telemetry.
 
 GPU and AIO stay unmanaged until you enable their toggles.
 
