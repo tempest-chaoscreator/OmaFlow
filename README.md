@@ -20,10 +20,14 @@ OmaFlow needs these to *apply* curves. Telemetry (CPU/GPU/coolant temps, RPM) wo
 | --- | --- |
 | [liquidctl](https://github.com/liquidctl/liquidctl) | AIO pump, radiator, LCD |
 | [fan2go](https://github.com/markusressel/fan2go) | Chassis / motherboard PWM fans |
-| `nvidia-settings` | GPU fans, only after you enable GPU on Curves |
+| `nvidia-settings` | GPU fans, only after you enable GPU on Settings |
 | Python 3 | Already on Omarchy. Pillow is used to draw a tinted liquid-temp LCD |
 
-**You do not have to install these by hand.** Open the widget the first time and press **Install dependencies**. That runs `setup` in a floating terminal (sudo once): liquidctl, fan2go from the AUR, a polkit helper, and the fan2go systemd unit.
+Open the widget the first time and press **Install dependencies**. That runs `setup` in a floating terminal (sudo once): liquidctl from the Omarchy package set, a polkit helper, and the fan2go systemd unit.
+
+Install **fan2go yourself** so `/usr/bin/fan2go` is the packaged binary. Setup does not download it and does not build it from the AUR. Chassis PWM still works through the helper if the package is not installed yet; run setup again after installing fan2go to enable the service.
+
+If the cooler uses motherboard headers instead of USB (a one-cable Arctic-style AIO, or no AIO at all), press **Install fan control only**. That installs the helper and skips liquidctl.
 
 `omarchy plugin add` never runs package managers or sudo. The setup script is the only step that asks for a password.
 
@@ -54,7 +58,7 @@ AIO radiator fans on this build sit on an NZXT PWM hub into a motherboard header
 <details>
 <summary>NVIDIA</summary>
 
-GPU fan control through `nvidia-settings` after you enable **GPU** on Curves. Zero-RPM idle (RTX 30-series Founders, and similar) is handed back to NVIDIA auto when the curve is 0%. Telemetry uses `nvidia-smi`.
+GPU fan control through `nvidia-settings` after you enable **GPU** on Settings. Zero-RPM idle (RTX 30-series Founders, and similar) is handed back to NVIDIA auto when the curve is 0%. Telemetry uses `nvidia-smi`.
 
 - GeForce RTX 20 / 30 / 40 series
 - GeForce GTX 16 series and newer with working `nvidia-settings` fan control
@@ -126,7 +130,7 @@ omarchy bar move tempest-chaoscreator.omaflow --section right
 omarchy plugin remove tempest-chaoscreator.omaflow
 ```
 
-That deletes the plugin folder and its bar entry. fan2go and liquidctl stay installed; drop them with `omarchy pkg drop liquidctl` and `omarchy pkg drop fan2go-git` if you want them gone. The helper lives at `/usr/local/lib/omaflow/omaflow-helper` and the unit at `/etc/systemd/system/fan2go.service`.
+That deletes the plugin folder and its bar entry. liquidctl and fan2go stay installed; drop liquidctl with `omarchy pkg drop liquidctl`, and remove fan2go with the same package manager you used to install it. The helper lives at `/usr/local/lib/omaflow/omaflow-helper`, the unit at `/etc/systemd/system/fan2go.service`, the config at `/etc/fan2go/fan2go.yaml`, and the database at `/var/lib/omaflow/fan2go.db`.
 
 ## Using it
 
@@ -134,23 +138,27 @@ That deletes the plugin folder and its bar entry. fan2go and liquidctl stay inst
 | --- | --- |
 | Left click the chip | Open / close the panel |
 | Right click | Toggle Silent ↔ Performance |
-| Middle click | Switch Telemetry / Curves |
+| Middle click | Switch Telemetry / Settings |
 | `1`–`5` | Silent, Static, Performance, Hell, Custom |
-| `m` / `c` | Telemetry / Curves |
+| `m` / `s` | Telemetry / Settings (`c` still opens Settings) |
 | Escape | Close |
 
-**Telemetry** — CPU (Tctl + CCDs), GPU (temp, load, power, fan), coolant, pump, chassis RPM, one-minute sparkline.
+**Telemetry** — CPU (Tctl + CCDs), GPU (temp, load, power, fan), coolant, pump, chassis RPM, one-minute sparkline. The mode buttons on this page are the ones that change the live curve.
 
-**Curves** — five modes and an NZXT CAM-style graph (15 temperature columns, 20–90 °C). Drag a handle up and the points to its right come with it. Silent / Static / Performance / Hell share one padlock. Custom is always unlocked. Reset restores only the selected channel (Chassis, Pump, AIO, or GPU). Edits on this tab do not change the live mode, pick that on Telemetry.
+**Settings** — five modes and an NZXT CAM-style graph. CPU-temperature graphs run 28–98 °C. Liquid-temperature graphs (Pump, AIO, and CPU) run 28–60 °C, which is as hot as coolant should get. GPU stays on 20–90 °C. Drag a handle up and the points to its right come with it. Silent / Static / Performance / Hell share one padlock. Custom is always unlocked. Reset restores only the selected channel. Edits on this tab do not change the live mode; pick that on Telemetry.
 
-GPU and AIO stay unmanaged until you enable their toggles.
+Pump, AIO, and CPU each have a curve input: CPU temp or liquid temp. GPU and AIO (and CPU, when a CPU fan header is detected) hide their on/off switch until you select that card. The card grows to show a horizontal switch. CPU stays grey when fan2go sees no CPU fan. The info mark next to Reset explains one-cable AIOs: leave the CPU switch off and let the BIOS run `CPU_FAN`, or split the cable so the pump is on `AIO_PUMP` and the radiator fans are on `CPU_FAN`.
+
+The bottom of Settings exports and imports a JSON file of the stored curves and settings.
+
+GPU, AIO, and the CPU header stay unmanaged until you enable their switches.
 
 | Mode | Fans | Pump |
 | --- | --- | --- |
-| **Silent** | Low floor, slow ramp | 50% floor, gentle rise |
-| **Static** | Flat 40% | Flat 50% |
-| **Performance** | Steep ramp | 50% → 100% |
-| **Hell** | High floor, stays aggressive | 60% floor, holds the steep curve |
+| **Silent** | Low floor, slow ramp | 50% floor, then up with CPU temp |
+| **Static** | Flat 50% | Flat 60% |
+| **Performance** | Steep ramp | 75% floor, then up |
+| **Hell** | High floor, stays aggressive | 75% until warm, then 100% |
 | **Custom** | Yours | Yours (still 50% minimum) |
 
 Pump duty never goes below 50% in any mode, including Custom — dragging a pump handle below that floor snaps it back.
@@ -163,12 +171,19 @@ AIO LCD:
 
 ## How it applies
 
-- **fan2go** owns motherboard / NZXT Smart Device chassis fans. OmaFlow writes `~/.config/omaflow/fan2go.yaml` and restarts the service through the helper.
-- **nvidia-settings** owns GPU fans only after you enable GPU on Curves. A 0% target returns the card to NVIDIA auto so 3090 zero-RPM idle works.
+- **fan2go** owns motherboard / NZXT Smart Device chassis fans. The bridge keeps a copy of the curve at `~/.config/omaflow/fan2go.yaml`. The root service does not read that file. It reads `/etc/fan2go/fan2go.yaml`, which the helper republishes after checking the document. The database is `/var/lib/omaflow/fan2go.db`.
+- **nvidia-settings** owns GPU fans only after you enable GPU on Settings. A 0% target returns the card to NVIDIA auto so 3090 zero-RPM idle works.
+- A detected **CPU fan** header is driven by fan2go only after you enable CPU. Off, that header is left to the BIOS.
 - **liquidctl** owns the AIO: pump curve, radiator curve, LCD, optional LEDs. Those profiles live on the device.
 - If fan2go is not running yet, the bridge holds chassis PWM itself so the modes still do something after setup.
 
 Telemetry is always available from hwmon and `nvidia-smi`, even before the stack is installed.
+
+## Privileged paths
+
+Setup pins `scripts/omaflow_helper.py` to a SHA-256 in the setup script. It reads that file once, checks the digest, and passes the bytes to a root installer on stdin. The installer does not open the plugin directory. An active local member of `wheel` can run the installed helper without a password. Its commands are fixed: write a PWM value, release a header back to the BIOS, publish a checked curve document, import an existing root-owned fan database once, restart the unit, and check that `/usr/bin/fan2go` is a root-owned binary.
+
+The helper refuses `cmd` and `file` fans, refuses any database path other than `/var/lib/omaflow/fan2go.db`, and binds the API to `127.0.0.1:9001`. The unit sets `ProtectHome` and `PrivateTmp`, so the root daemon cannot read the home directory or `/tmp`.
 
 ## License
 

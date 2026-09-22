@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "tempest-chaoscreator.omaflow",
   "name": "OmaFlow",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "author": "Tempest",
   "license": "MIT",
   "homepage": "https://github.com/tempest-chaoscreator/OmaFlow",
@@ -25,7 +25,8 @@
       "themeSync": true,
       "lcdMode": "liquid",
       "gpuControl": false,
-      "aioFanControl": false
+      "aioFanControl": false,
+      "cpuControl": false
     },
     "schema": [
       {
@@ -33,6 +34,13 @@
         "type": "boolean",
         "label": "Control GPU fans",
         "description": "Off (default): the NVIDIA driver keeps its own fan curve. On: OmaFlow drives the GPU fans with the selected mode.",
+        "defaultValue": false
+      },
+      {
+        "key": "cpuControl",
+        "type": "boolean",
+        "label": "Control the CPU fan header",
+        "description": "Off (default): the BIOS keeps the CPU_FAN header. On: OmaFlow drives a detected CPU fan. Leave this off for a one-cable AIO plugged into CPU_FAN.",
         "defaultValue": false
       },
       {

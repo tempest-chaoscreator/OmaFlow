@@ -12,6 +12,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import struct
 import subprocess
 import sys
@@ -24,12 +25,21 @@ import zlib
 from collections import deque
 from pathlib import Path
 
-TEMPS = list(range(20, 91, 5))  # 15 points, 20–90 °C
-POINT_COUNT = len(TEMPS)
+# CPU-temperature graphs: 28–98 °C. GPU stays on the 20–90 axis the
+# Silent handoff was tuned against. Coolant graphs stop at 60 °C.
+OLD_TEMPS = list(range(20, 91, 5))
+CPU_TEMPS = list(range(28, 99, 5))
+GPU_TEMPS = list(OLD_TEMPS)
+LIQUID_TEMPS = list(range(28, 61, 2))
+TEMPS = CPU_TEMPS
+POINT_COUNT = len(CPU_TEMPS)
 FAN_MIN = 20
 PUMP_MIN = 50
-CHANNELS = ("chassis", "gpu", "aio", "pump")
+CHANNELS = ("chassis", "cpu", "gpu", "aio", "pump")
+SENSOR_CHANNELS = ("pump", "aio", "cpu")
 MODES = ("silent", "static", "performance", "hell", "custom")
+CPU_FAN_RE = re.compile(r"cpu[_\s-]?fan|(^|[^a-z])cpu([^a-z]|$)", re.I)
+CPU_FAN_SKIP_RE = re.compile(r"opt|pump|water|flow|aio|gpu|chassis", re.I)
 HISTORY_LEN = 60
 POLL_S = 1.0
 APPLY_DEBOUNCE_S = 0.8
@@ -37,6 +47,8 @@ FAN2GO_API = "http://127.0.0.1:9001"
 CONFIG_DIR = Path.home() / ".config" / "omaflow"
 STATE_PATH = CONFIG_DIR / "state.json"
 YAML_PATH = CONFIG_DIR / "fan2go.yaml"
+FAN2GO_DB = "/var/lib/omaflow/fan2go.db"
+FAN2GO_BIN = Path("/usr/bin/fan2go")
 LCD_PNG = CONFIG_DIR / "lcd-accent.png"
 THEME_COLORS = Path.home() / ".local/state/omarchy/current/theme/colors.toml"
 LCD_SIZE = 320
@@ -130,87 +142,161 @@ def _flat(v):
     return _fill([v] * POINT_COUNT)
 
 
-PRESETS = {
+def _fill_n(values, count):
+    out = [int(round(clamp(v, 0, 100))) for v in values]
+    if len(out) != count:
+        raise RuntimeError("preset length")
+    return out
+
+
+def _flat_n(v, count):
+    return _fill_n([v] * count, count)
+
+
+# Air curves sit on CPU_TEMPS (28–98). GPU stays on GPU_TEMPS (20–90)
+# and is filled separately because _fill() is locked to POINT_COUNT.
+_AIR = {
     "silent": {
-        "chassis": _fill([29, 29, 31, 33, 35, 37, 41, 45, 49, 53, 57, 61, 65, 69, 73]),
+        "chassis": [30, 32, 34, 36, 39, 43, 47, 51, 55, 59, 63, 67, 71, 73, 73],
+        "aio": [30, 32, 34, 36, 39, 43, 47, 51, 55, 59, 63, 67, 71, 73, 73],
+        "pump": [50, 50, 50, 50, 54, 61, 68, 76, 83, 90, 97, 100, 100, 100, 100],
+    },
+    "static": {
+        "chassis": [50] * POINT_COUNT,
+        "aio": [50] * POINT_COUNT,
+        "pump": [60] * POINT_COUNT,
+    },
+    "performance": {
+        "chassis": [26, 32, 39, 48, 58, 68, 78, 87, 94, 98, 100, 100, 100, 100, 100],
+        "aio": [26, 32, 39, 48, 58, 68, 78, 87, 94, 98, 100, 100, 100, 100, 100],
+        "pump": [75, 75, 75, 75, 75, 79, 85, 92, 98, 100, 100, 100, 100, 100, 100],
+    },
+    "hell": {
+        "chassis": [50, 56, 62, 69, 77, 85, 92, 98, 100, 100, 100, 100, 100, 100, 100],
+        "aio": [50, 56, 62, 69, 77, 85, 92, 98, 100, 100, 100, 100, 100, 100, 100],
+        # 75% through 38 °C, then up to 100% by 48 °C.
+        "pump": [75, 75, 75, 90, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100],
+    },
+}
+
+PRESETS = {}
+for _mode, _chs in _AIR.items():
+    PRESETS[_mode] = {
+        "chassis": _fill(_chs["chassis"]),
+        "cpu": _fill(_chs["chassis"]),
+        "aio": _fill(_chs["aio"]),
+        "pump": _fill(_chs["pump"]),
         # 0% below ~30 °C (NVIDIA auto / zero-RPM). Take over at 35 °C
         # around the 3090's ~30% floor so auto does not spin the fans
         # while Silent still says 0%.
-        "gpu": _fill([0, 0, 0, 30, 32, 34, 37, 41, 46, 52, 60, 68, 76, 84, 91]),
-        "aio": _fill([29, 29, 31, 33, 35, 37, 41, 45, 49, 53, 57, 61, 65, 69, 73]),
-        "pump": _fill([50, 50, 50, 50, 50, 50, 57, 64, 71, 79, 86, 93, 100, 100, 100]),
+        "gpu": _fill({
+            "silent": [0, 0, 0, 30, 32, 34, 37, 41, 46, 52, 60, 68, 76, 84, 91],
+            "static": [50] * POINT_COUNT,
+            "performance": [20, 22, 26, 32, 40, 50, 60, 70, 80, 88, 94, 100, 100, 100, 100],
+            "hell": [40, 44, 50, 56, 64, 72, 80, 88, 94, 100, 100, 100, 100, 100, 100],
+        }[_mode]),
+    }
+
+# Coolant curves are 28–60 °C. Pump keeps the 50% floor.
+_LIQ_N = len(LIQUID_TEMPS)
+LIQUID_PRESETS = {
+    "silent": {
+        "pump": _fill_n([50, 50, 50, 50, 50, 50, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 100], _LIQ_N),
+        "aio": _fill_n([30, 30, 30, 30, 30, 30, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80], _LIQ_N),
+        "cpu": _fill_n([30, 30, 30, 30, 30, 30, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80], _LIQ_N),
     },
     "static": {
-        "chassis": _flat(50),
-        "gpu": _flat(50),
-        "aio": _flat(50),
-        "pump": _flat(60),
+        "pump": _flat_n(60, _LIQ_N),
+        "aio": _flat_n(50, _LIQ_N),
+        "cpu": _flat_n(50, _LIQ_N),
     },
     "performance": {
-        "chassis": _fill([22, 24, 28, 34, 42, 52, 62, 72, 82, 90, 96, 100, 100, 100, 100]),
-        "gpu": _fill([20, 22, 26, 32, 40, 50, 60, 70, 80, 88, 94, 100, 100, 100, 100]),
-        "aio": _fill([22, 24, 28, 34, 42, 52, 62, 72, 82, 90, 96, 100, 100, 100, 100]),
-        "pump": _fill([75, 75, 75, 75, 75, 75, 75, 81, 88, 94, 100, 100, 100, 100, 100]),
+        "pump": _fill_n([75, 75, 75, 75, 75, 78, 81, 84, 88, 91, 94, 97, 100, 100, 100, 100, 100], _LIQ_N),
+        "aio": _fill_n([45, 45, 45, 45, 45, 52, 59, 66, 73, 80, 87, 94, 100, 100, 100, 100, 100], _LIQ_N),
+        "cpu": _fill_n([45, 45, 45, 45, 45, 52, 59, 66, 73, 80, 87, 94, 100, 100, 100, 100, 100], _LIQ_N),
     },
     "hell": {
-        "chassis": _fill([45, 48, 52, 58, 65, 72, 80, 88, 95, 100, 100, 100, 100, 100, 100]),
-        "gpu": _fill([40, 44, 50, 56, 64, 72, 80, 88, 94, 100, 100, 100, 100, 100, 100]),
-        "aio": _fill([45, 48, 52, 58, 65, 72, 80, 88, 95, 100, 100, 100, 100, 100, 100]),
-        # 75% until 40 °C, then one step to 100% at 45 °C.
-        "pump": _fill([75, 75, 75, 75, 75, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100]),
+        "pump": _fill_n([75, 75, 75, 75, 75, 75, 75, 75, 88, 94, 100, 100, 100, 100, 100, 100, 100], _LIQ_N),
+        "aio": _fill_n([60, 60, 60, 60, 60, 70, 80, 90, 100, 100, 100, 100, 100, 100, 100, 100, 100], _LIQ_N),
+        "cpu": _fill_n([60, 60, 60, 60, 60, 70, 80, 90, 100, 100, 100, 100, 100, 100, 100, 100, 100], _LIQ_N),
     },
 }
 
 
-def copy_points(points, minimum=0):
+def copy_points(points, minimum=0, count=POINT_COUNT):
     src = list(points) if isinstance(points, (list, tuple)) else []
     out = []
-    for i in range(POINT_COUNT):
+    n = int(count) if count else POINT_COUNT
+    for i in range(n):
         v = src[i] if i < len(src) else minimum
         out.append(int(round(clamp(v, minimum, 100))))
     return out
 
 
 def enforce_min(points, minimum):
-    return [max(minimum, int(v)) for v in copy_points(points, minimum)]
+    return [max(minimum, int(v)) for v in copy_points(points, minimum, len(points) if points else POINT_COUNT)]
 
 
-def apply_monotonic(points, index, value, minimum=0):
+def apply_monotonic(points, index, value, minimum=0, count=None):
     """Keep duty non-decreasing with temperature. Raising a point lifts
     every point to its right that would otherwise sit below it; lowering
     a point pulls every point to its left that would sit above it."""
-    pts = copy_points(points, minimum)
-    if not (0 <= index < POINT_COUNT):
+    n = int(count) if count else (len(points) if isinstance(points, (list, tuple)) and len(points) >= 2 else POINT_COUNT)
+    pts = copy_points(points, minimum, n)
+    if not (0 <= index < n):
         return pts
     v = int(round(clamp(value, minimum, 100)))
     pts[index] = v
-    for j in range(index + 1, POINT_COUNT):
+    for j in range(index + 1, n):
         if pts[j] < v:
             pts[j] = v
     for j in range(index - 1, -1, -1):
         if pts[j] > v:
             pts[j] = v
-    return enforce_min(pts, minimum)
+    return [max(minimum, int(p)) for p in pts]
 
 
-def duty_at(points, temp):
-    pts = copy_points(points)
-    t = clamp(temp, TEMPS[0], TEMPS[-1])
-    if t <= TEMPS[0]:
+def duty_at(points, temp, temps=None):
+    axis = list(temps) if temps else list(CPU_TEMPS)
+    pts = copy_points(points, 0, len(axis))
+    t = float(temp)
+    if t <= axis[0]:
         return pts[0]
-    if t >= TEMPS[-1]:
+    if t >= axis[-1]:
         return pts[-1]
-    for i in range(POINT_COUNT - 1):
-        a, b = TEMPS[i], TEMPS[i + 1]
+    for i in range(len(axis) - 1):
+        a, b = axis[i], axis[i + 1]
         if a <= t <= b:
             u = (t - a) / (b - a)
             return pts[i] + (pts[i + 1] - pts[i]) * u
     return pts[-1]
 
 
+def resample(points, src, dst, minimum=0):
+    src_pts = copy_points(points, minimum, len(src))
+    return [int(round(clamp(duty_at(src_pts, t, src), minimum, 100))) for t in dst]
+
+
+def axis_for(channel, sensor):
+    if channel == "gpu":
+        return GPU_TEMPS
+    if channel in SENSOR_CHANNELS and sensor == "liquid":
+        return LIQUID_TEMPS
+    return CPU_TEMPS
+
+
 def default_curves():
     curves = {mode: {ch: list(PRESETS[mode][ch]) for ch in CHANNELS} for mode in PRESETS}
     curves["custom"] = {ch: list(PRESETS["performance"][ch]) for ch in CHANNELS}
+    return curves
+
+
+def default_liquid_curves():
+    curves = {
+        mode: {ch: list(LIQUID_PRESETS[mode][ch]) for ch in SENSOR_CHANNELS}
+        for mode in LIQUID_PRESETS
+    }
+    curves["custom"] = {ch: list(LIQUID_PRESETS["performance"][ch]) for ch in SENSOR_CHANNELS}
     return curves
 
 
@@ -221,13 +307,17 @@ def default_state():
         "presetsLocked": True,
         "gpuControl": False,
         "aioFanControl": False,
+        "cpuControl": False,
         "curves": default_curves(),
+        "liquidCurves": default_liquid_curves(),
+        "sensors": {"pump": "cpu", "aio": "liquid", "cpu": "cpu"},
         "selectedChannel": "chassis",
         "lcdMode": "liquid",
         "lcdBrightness": 80,
         "themeSync": True,
         "accent": "",
         "pumpSensor": "cpu",
+        "axisVersion": 2,
     }
 
 
@@ -571,14 +661,15 @@ def write_solid_png(path: Path, hex_color: str, size: int = 320) -> None:
 
 # --- fan2go yaml -----------------------------------------------------------
 
-def steps_yaml(points, indent="        ") -> str:
+def steps_yaml(points, temps, minimum=0, indent="        ") -> str:
     lines = []
-    for temp, duty in zip(TEMPS, copy_points(points)):
-        lines.append(f"{indent}- {temp}: {int(duty)}%")
+    pts = copy_points(points, minimum, len(temps))
+    for temp, duty in zip(temps, pts):
+        lines.append(f"{indent}- {int(temp)}: {int(duty)}%")
     return "\n".join(lines)
 
 
-def staircase_curve(cid: str, sensor: str, points, hysteresis=6) -> list[str]:
+def staircase_curve(cid: str, sensor: str, points, temps, hysteresis=6, minimum=0) -> list[str]:
     return [
         f"  - id: {cid}",
         "    staircase:",
@@ -586,7 +677,7 @@ def staircase_curve(cid: str, sensor: str, points, hysteresis=6) -> list[str]:
         "      hysteresis:",
         f"        down: {int(hysteresis)}",
         "      steps:",
-        steps_yaml(points),
+        steps_yaml(points, temps, minimum),
     ]
 
 
@@ -606,6 +697,13 @@ def fan_common(never_stop: bool, min_pwm: int, max_pwm: int, start_pwm: int, cur
     ]
 
 
+def is_cpu_fan_label(label: str) -> bool:
+    text = label or ""
+    if CPU_FAN_SKIP_RE.search(text):
+        return False
+    return CPU_FAN_RE.search(text) is not None
+
+
 def fan_is_unused(fan: dict) -> bool:
     rpm_path = Path(fan.get("rpm_path") or "")
     enable_path = Path(fan.get("enable_path") or "")
@@ -614,21 +712,32 @@ def fan_is_unused(fan: dict) -> bool:
     return rpm == 0 and enable == 0
 
 
+def coolant_platform(chips):
+    for chip in chips:
+        if chip["name"] in AIO_HWMON and chip.get("temps"):
+            return chip["name"], int(chip["temps"][0]["index"])
+    return None
+
+
 def build_fan2go_yaml(state, chips, has_nvidia: bool = False) -> str:
     mode = state["mode"]
-    chassis_pts = copy_points(state["curves"][mode]["chassis"])
+    curves_state = state["curves"][mode]
+    chassis_pts = copy_points(curves_state["chassis"], 0, len(CPU_TEMPS))
     if mode != "silent":
-        chassis_pts = enforce_min(chassis_pts, FAN_MIN)
+        chassis_pts = [max(FAN_MIN, v) for v in chassis_pts]
     sensors = [
         "  - id: cpu_tctl",
         "    hwmon:",
         "      platform: k10temp",
         "      index: 1",
     ]
-    curves = staircase_curve("chassis_curve", "cpu_tctl", chassis_pts, hysteresis=6)
+    curves = staircase_curve("chassis_curve", "cpu_tctl", chassis_pts, CPU_TEMPS, hysteresis=6)
+    cpu_on = state.get("cpuControl") is True
+    cpu_sensor = (state.get("sensors") or {}).get("cpu") or "cpu"
     min_pwm = 51 if mode != "silent" else 32
     start_pwm = min_pwm
-    fans = []
+    chassis_ids = []
+    cpu_ids = []
     for chip in chips:
         name = chip["name"]
         if name in SKIP_FAN_HWMON or not any(c.isalpha() for c in name):
@@ -638,18 +747,54 @@ def build_fan2go_yaml(state, chips, has_nvidia: bool = False) -> str:
         for fan in chip["fans"]:
             if not fan["has_pwm"] or fan_is_unused(fan):
                 continue
-            idx = fan["index"]
-            fid = f"{name}_{idx}"
-            fans += [
-                f"  - id: {fid}",
+            entry = (name, fan["index"])
+            if is_cpu_fan_label(fan.get("label") or ""):
+                if cpu_on:
+                    cpu_ids.append(entry)
+            else:
+                chassis_ids.append(entry)
+    if cpu_ids:
+        if cpu_sensor == "liquid" and coolant_platform(chips):
+            platform, index = coolant_platform(chips)
+            sensors += [
+                "  - id: coolant",
                 "    hwmon:",
-                f"      platform: {name}",
-                f"      rpmChannel: {idx}",
-                f"      pwmChannel: {idx}",
-            ] + fan_common(True, min_pwm, 255, start_pwm, "chassis_curve")
+                f"      platform: {platform}",
+                f"      index: {index}",
+            ]
+            cpu_pts = copy_points(state["liquidCurves"][mode]["cpu"], 0, len(LIQUID_TEMPS))
+            curves += staircase_curve("cpu_curve", "coolant", cpu_pts, LIQUID_TEMPS, hysteresis=2)
+            cpu_curve_id = "cpu_curve"
+        else:
+            cpu_pts = copy_points(curves_state.get("cpu") or curves_state["chassis"], 0, len(CPU_TEMPS))
+            if mode != "silent":
+                cpu_pts = [max(FAN_MIN, v) for v in cpu_pts]
+            curves += staircase_curve("cpu_curve", "cpu_tctl", cpu_pts, CPU_TEMPS, hysteresis=6)
+            cpu_curve_id = "cpu_curve"
+    else:
+        cpu_curve_id = "chassis_curve"
+    fans = []
+    for name, idx in chassis_ids:
+        fid = f"{name}_{idx}"
+        fans += [
+            f"  - id: {fid}",
+            "    hwmon:",
+            f"      platform: {name}",
+            f"      rpmChannel: {idx}",
+            f"      pwmChannel: {idx}",
+        ] + fan_common(True, min_pwm, 255, start_pwm, "chassis_curve")
+    for name, idx in cpu_ids:
+        fid = f"{name}_{idx}"
+        fans += [
+            f"  - id: {fid}",
+            "    hwmon:",
+            f"      platform: {name}",
+            f"      rpmChannel: {idx}",
+            f"      pwmChannel: {idx}",
+        ] + fan_common(True, min_pwm, 255, start_pwm, cpu_curve_id)
     body = "\n".join([
         "# Generated by OmaFlow. Overwritten when a mode or curve is applied.",
-        f"dbPath: {Path.home() / '.local/share/omaflow/fan2go.db'}",
+        f"dbPath: {FAN2GO_DB}",
         "runFanInitializationInParallel: false",
         "tempRollingWindowSize: 12",
         "fanController:",
@@ -679,25 +824,89 @@ def fan2go_api(path: str):
 
 # --- helper / apply --------------------------------------------------------
 
+def settings_path(raw: str):
+    if not raw:
+        return None
+    path = Path(str(raw)).expanduser()
+    try:
+        path = path.resolve()
+    except OSError:
+        return None
+    home = Path.home().resolve()
+    if path != home and home not in path.parents:
+        return None
+    if path.suffix.lower() != ".json":
+        return None
+    return path
+
+
+def helper_trusted() -> bool:
+    """The root helper only. Never the copy in the writable plugin checkout."""
+    try:
+        st = HELPER_INSTALLED.lstat()
+    except OSError:
+        return False
+    if not stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode):
+        return False
+    if st.st_uid != 0 or st.st_mode & 0o022:
+        return False
+    return True
+
+
+def system_fan2go() -> bool:
+    """Packaged binary only. A fan2go earlier on PATH is not the root service."""
+    try:
+        listed = FAN2GO_BIN.lstat()
+        st = FAN2GO_BIN.stat()
+    except OSError:
+        return False
+    if stat.S_ISLNK(listed.st_mode):
+        target = os.path.realpath(FAN2GO_BIN)
+        if not target.startswith("/usr/"):
+            return False
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o022:
+        return False
+    return os.access(FAN2GO_BIN, os.X_OK)
+
+
 def helper_bin():
-    if HELPER_INSTALLED.is_file():
-        return str(HELPER_INSTALLED)
-    here = Path(__file__).resolve().parent / "omaflow_helper.py"
-    return str(here) if here.is_file() else ""
+    return str(HELPER_INSTALLED) if helper_trusted() else ""
 
 
 def pkexec_helper(*args):
     helper = helper_bin()
     if not helper:
         return False, "helper missing"
-    pkexec = which("pkexec")
-    cmd = [pkexec, helper, *args] if pkexec and os.geteuid() != 0 else [helper, *args]
-    # Direct python if the installed helper is the .py in the plugin.
-    if helper.endswith(".py") and os.geteuid() != 0 and pkexec:
-        cmd = [pkexec, sys.executable, helper, *args]
+    if os.geteuid() == 0:
+        cmd = [helper, *args]
+    elif os.path.isfile("/usr/bin/pkexec") and os.access("/usr/bin/pkexec", os.X_OK):
+        cmd = ["/usr/bin/pkexec", helper, *args]
+    else:
+        return False, "pkexec missing"
     r = run(cmd, timeout=25)
     ok = r.returncode == 0
     return ok, (r.stdout + r.stderr).strip()
+
+
+def release_pwm_auto(hwmon_name: str, channel: int) -> bool:
+    """Hand a header back to the firmware curve (pwm_enable=2)."""
+    root = Path("/sys/class/hwmon")
+    enable = None
+    if root.exists():
+        for entry in root.iterdir():
+            if read_text(entry / "name") == hwmon_name:
+                path = entry / f"pwm{channel}_enable"
+                if path.exists():
+                    enable = path
+                break
+    if enable is not None:
+        try:
+            enable.write_text("2", encoding="utf-8")
+            return True
+        except OSError:
+            pass
+    ok, _ = pkexec_helper("release-pwm", hwmon_name, str(channel))
+    return ok
 
 
 def write_pwm_user_or_helper(hwmon_name: str, channel: int, pwm: int, privileged: bool = False) -> bool:
@@ -753,10 +962,11 @@ def restore_nvidia_auto() -> bool:
     return r.returncode == 0
 
 
-def liquidctl_profile(channel: str, points, minimum: int) -> bool:
-    pts = enforce_min(points, minimum)
+def liquidctl_profile(channel: str, points, temps, minimum: int) -> bool:
+    axis = list(temps)
+    pts = copy_points(points, minimum, len(axis))
     args = ["--match", "kraken", "set", channel, "speed"]
-    for temp, duty in zip(TEMPS, pts):
+    for temp, duty in zip(axis, pts):
         args += [str(int(temp)), str(int(duty))]
     r = liquidctl_cmd(*args, timeout=12)
     if r is None:
@@ -764,10 +974,11 @@ def liquidctl_profile(channel: str, points, minimum: int) -> bool:
     if r.returncode == 0:
         return True
     # Some AIOs reject long profiles; fall back to 7 keypoints.
-    key_i = [0, 2, 4, 6, 8, 11, 14]
+    last = len(axis) - 1
+    key_i = sorted({round(i * last / 6) for i in range(7)})
     args = ["--match", "kraken", "set", channel, "speed"]
     for i in key_i:
-        args += [str(TEMPS[i]), str(int(pts[i]))]
+        args += [str(int(axis[i])), str(int(pts[i]))]
     r = liquidctl_cmd(*args, timeout=12)
     return r is not None and r.returncode == 0
 
@@ -776,6 +987,146 @@ def liquidctl_fixed_speed(channel: str, percent: int) -> bool:
     pct = int(clamp(percent, 0, 100))
     r = liquidctl_cmd("--match", "kraken", "set", channel, "speed", str(pct), timeout=12)
     return r is not None and r.returncode == 0
+
+
+def _legacy_v110():
+    """1.1.0 factory curves on the old 20–90 axis. Kept so unedited
+    curves upgrade before they are moved onto 28–98 / 28–60."""
+    n = len(OLD_TEMPS)
+    return {
+        "silent": {
+            "chassis": [29, 29, 31, 33, 35, 37, 41, 45, 49, 53, 57, 61, 65, 69, 73],
+            "gpu": [0, 0, 0, 30, 32, 34, 37, 41, 46, 52, 60, 68, 76, 84, 91],
+            "aio": [29, 29, 31, 33, 35, 37, 41, 45, 49, 53, 57, 61, 65, 69, 73],
+            "pump": [50, 50, 50, 50, 50, 50, 57, 64, 71, 79, 86, 93, 100, 100, 100],
+        },
+        "static": {
+            "chassis": [50] * n,
+            "gpu": [50] * n,
+            "aio": [50] * n,
+            "pump": [60] * n,
+        },
+        "performance": {
+            "chassis": [22, 24, 28, 34, 42, 52, 62, 72, 82, 90, 96, 100, 100, 100, 100],
+            "gpu": [20, 22, 26, 32, 40, 50, 60, 70, 80, 88, 94, 100, 100, 100, 100],
+            "aio": [22, 24, 28, 34, 42, 52, 62, 72, 82, 90, 96, 100, 100, 100, 100],
+            "pump": [75, 75, 75, 75, 75, 75, 75, 81, 88, 94, 100, 100, 100, 100, 100],
+        },
+        "hell": {
+            "chassis": [45, 48, 52, 58, 65, 72, 80, 88, 95, 100, 100, 100, 100, 100, 100],
+            "gpu": [40, 44, 50, 56, 64, 72, 80, 88, 94, 100, 100, 100, 100, 100, 100],
+            "aio": [45, 48, 52, 58, 65, 72, 80, 88, 95, 100, 100, 100, 100, 100, 100],
+            "pump": [75, 75, 75, 75, 75, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100],
+        },
+    }
+
+
+def _upgrade_legacy_curve(points, replacements, fallback):
+    cur = copy_points(points, 0, len(OLD_TEMPS))
+    for old in replacements:
+        if cur == copy_points(old, 0, len(OLD_TEMPS)):
+            return copy_points(fallback, 0, len(OLD_TEMPS))
+    return cur
+
+
+def migrate_legacy_curves(data, base):
+    """Move a 1.x state onto axisVersion 2.
+
+    Chassis and CPU-sensor pump curves were authored against 20–90 and
+    move to 28–98, keeping the duty at each temperature. AIO curves were
+    uploaded to the cooler as liquid temperatures, so they move to the
+    28–60 coolant axis. GPU stays on 20–90.
+    """
+    v110 = _legacy_v110()
+    v110["custom"] = {ch: list(v110["performance"][ch]) for ch in v110["performance"]}
+    ancient = {
+        "silent": {
+            "chassis": [
+                [18, 18, 20, 22, 24, 26, 30, 34, 38, 42, 46, 50, 54, 58, 62],
+                [26, 26, 28, 30, 32, 34, 38, 42, 46, 50, 54, 58, 62, 66, 70],
+            ],
+            "gpu": [
+                [0, 0, 0, 0, 0, 0, 0, 0, 20, 30, 42, 54, 64, 72, 80],
+                [0, 0, 0, 0, 0, 0, 18, 24, 30, 38, 46, 54, 62, 70, 78],
+                [0, 0, 0, 0, 0, 0, 0, 0, 28, 38, 50, 62, 72, 80, 88],
+                [0, 0, 0, 0, 0, 0, 0, 0, 31, 41, 53, 65, 75, 83, 91],
+            ],
+            "aio": [
+                [18, 18, 20, 22, 24, 26, 30, 34, 38, 42, 46, 50, 54, 58, 62],
+                [26, 26, 28, 30, 32, 34, 38, 42, 46, 50, 54, 58, 62, 66, 70],
+            ],
+            "pump": [
+                [50, 50, 50, 50, 50, 52, 54, 56, 58, 60, 62, 64, 66, 68, 70],
+                [58, 58, 58, 58, 58, 60, 62, 64, 66, 68, 70, 72, 74, 76, 78],
+                [61, 61, 61, 61, 63, 65, 67, 69, 71, 73, 75, 77, 79, 81],
+            ],
+        },
+        "static": {
+            "chassis": [[25] * 15, [40] * 15],
+            "gpu": [[25] * 15, [40] * 15],
+            "aio": [[25] * 15, [40] * 15],
+            "pump": [[50] * 15],
+        },
+        "performance": {
+            "pump": [[50, 50, 52, 55, 58, 62, 68, 74, 80, 85, 90, 94, 96, 98, 100]],
+        },
+        "hell": {
+            "pump": [[60, 62, 65, 70, 75, 80, 85, 90, 94, 98, 100, 100, 100, 100, 100]],
+        },
+    }
+    stored = data.get("curves") or {}
+    legacy = {}
+    for mode in MODES:
+        src = stored.get(mode) or {}
+        legacy[mode] = {}
+        for ch in ("chassis", "gpu", "aio", "pump"):
+            fallback = v110[mode][ch]
+            raw = src.get(ch, fallback)
+            legacy[mode][ch] = _upgrade_legacy_curve(raw, ancient.get(mode, {}).get(ch, []), fallback)
+    pump_was_liquid = data.get("pumpSensor") == "liquid"
+    for mode in MODES:
+        base["curves"][mode]["chassis"] = resample(legacy[mode]["chassis"], OLD_TEMPS, CPU_TEMPS, 0)
+        base["curves"][mode]["cpu"] = list(base["curves"][mode]["chassis"])
+        base["curves"][mode]["gpu"] = copy_points(legacy[mode]["gpu"], 0, len(GPU_TEMPS))
+        base["curves"][mode]["aio"] = list(PRESETS["performance" if mode == "custom" else mode]["aio"])
+        if pump_was_liquid:
+            base["liquidCurves"][mode]["pump"] = resample(legacy[mode]["pump"], OLD_TEMPS, LIQUID_TEMPS, PUMP_MIN)
+            base["curves"][mode]["pump"] = list(PRESETS["performance" if mode == "custom" else mode]["pump"])
+        else:
+            base["curves"][mode]["pump"] = resample(legacy[mode]["pump"], OLD_TEMPS, CPU_TEMPS, PUMP_MIN)
+        base["liquidCurves"][mode]["aio"] = resample(legacy[mode]["aio"], OLD_TEMPS, LIQUID_TEMPS, 0)
+    base["sensors"] = {
+        "pump": "liquid" if pump_was_liquid else "cpu",
+        "aio": "liquid",
+        "cpu": "cpu",
+    }
+    base["pumpSensor"] = base["sensors"]["pump"]
+    base["axisVersion"] = 2
+
+
+def load_current_curves(data, base):
+    curves = data.get("curves") or {}
+    liquid = data.get("liquidCurves") or {}
+    for mode in MODES:
+        src = curves.get(mode) or {}
+        for ch in CHANNELS:
+            temps = GPU_TEMPS if ch == "gpu" else CPU_TEMPS
+            minimum = PUMP_MIN if ch == "pump" else 0
+            if ch in src:
+                base["curves"][mode][ch] = copy_points(src[ch], minimum, len(temps))
+        src_l = liquid.get(mode) or {}
+        for ch in SENSOR_CHANNELS:
+            minimum = PUMP_MIN if ch == "pump" else 0
+            if ch in src_l:
+                base["liquidCurves"][mode][ch] = copy_points(src_l[ch], minimum, len(LIQUID_TEMPS))
+    sensors = data.get("sensors") or {}
+    for ch in SENSOR_CHANNELS:
+        if sensors.get(ch) in ("cpu", "liquid"):
+            base["sensors"][ch] = sensors[ch]
+    if data.get("pumpSensor") in ("cpu", "liquid") and "pump" not in sensors:
+        base["sensors"]["pump"] = data["pumpSensor"]
+    base["pumpSensor"] = base["sensors"]["pump"]
+    base["axisVersion"] = 2
 
 
 class OmaFlow:
@@ -796,9 +1147,9 @@ class OmaFlow:
         self.last_error = ""
         self.apply_error = ""
         self.fan2go_running = False
-        self.fan2go_installed = bool(which("fan2go"))
+        self.fan2go_installed = system_fan2go()
         self.liquidctl_installed = bool(liquidctl_bin())
-        self.helper_ready = HELPER_INSTALLED.is_file()
+        self.helper_ready = helper_trusted()
         self._apply_timer = None
         self._save_timer = None
         self._stop = threading.Event()
@@ -809,15 +1160,21 @@ class OmaFlow:
         self._last_pwm = {}
         self._last_gpu_duty = None
         self._last_pump_duty = None
+        self._last_aio_duty = None
         self._nvidia_manual = False
         self._curve_rev = 0
         self._liquidctl_inited = False
+        self._release_cpu_fans = False
+        self.notice = ""
         self._chips_cached = []
         self._chips_at = 0.0
         self._last_liquidctl_status = 0.0
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         (Path.home() / ".local/share/omaflow").mkdir(parents=True, exist_ok=True)
+        self._save_after_load = False
         self.load_state()
+        if self._save_after_load:
+            self.save_state()
 
     def load_state(self) -> None:
         if not STATE_PATH.exists():
@@ -841,15 +1198,13 @@ class OmaFlow:
             base["gpuControl"] = bool(data["gpuControl"])
         if "aioFanControl" in data:
             base["aioFanControl"] = bool(data["aioFanControl"])
-        curves = data.get("curves") or {}
-        for mode in MODES:
-            src = curves.get(mode) or {}
-            for ch in CHANNELS:
-                minimum = PUMP_MIN if ch == "pump" else 0
-                if ch in src:
-                    base["curves"][mode][ch] = copy_points(src[ch], minimum)
-                    if ch == "pump":
-                        base["curves"][mode][ch] = enforce_min(base["curves"][mode][ch], PUMP_MIN)
+        if "cpuControl" in data:
+            base["cpuControl"] = bool(data["cpuControl"])
+        if int(data.get("axisVersion") or 1) >= 2:
+            load_current_curves(data, base)
+        else:
+            migrate_legacy_curves(data, base)
+            self._save_after_load = True
         if data.get("selectedChannel") in CHANNELS:
             base["selectedChannel"] = data["selectedChannel"]
         if data.get("lcdMode") in ("liquid", "accent", "off"):
@@ -860,60 +1215,6 @@ class OmaFlow:
             base["themeSync"] = bool(data["themeSync"])
         if data.get("accent"):
             base["accent"] = str(data["accent"])
-        if data.get("pumpSensor") in ("cpu", "liquid"):
-            base["pumpSensor"] = data["pumpSensor"]
-        # Replace factory curves the user has not edited.
-        old_factory = {
-            "silent": {
-                "chassis": [18, 18, 20, 22, 24, 26, 30, 34, 38, 42, 46, 50, 54, 58, 62],
-                "gpu": [0, 0, 0, 0, 0, 0, 0, 0, 20, 30, 42, 54, 64, 72, 80],
-                "aio": [18, 18, 20, 22, 24, 26, 30, 34, 38, 42, 46, 50, 54, 58, 62],
-                "pump": [50, 50, 50, 50, 50, 52, 54, 56, 58, 60, 62, 64, 66, 68, 70],
-            },
-            "static": {
-                "chassis": [25] * POINT_COUNT,
-                "gpu": [25] * POINT_COUNT,
-                "aio": [25] * POINT_COUNT,
-            },
-        }
-        old_silent_gpu_v1 = [0, 0, 0, 0, 0, 0, 18, 24, 30, 38, 46, 54, 62, 70, 78]
-        for mode, channels in old_factory.items():
-            for ch, old in channels.items():
-                if copy_points(base["curves"][mode][ch]) == copy_points(old):
-                    base["curves"][mode][ch] = list(PRESETS[mode][ch])
-        if copy_points(base["curves"]["silent"]["gpu"]) == copy_points(old_silent_gpu_v1):
-            base["curves"]["silent"]["gpu"] = list(PRESETS["silent"]["gpu"])
-        old_silent_v2 = {
-            "chassis": [26, 26, 28, 30, 32, 34, 38, 42, 46, 50, 54, 58, 62, 66, 70],
-            "gpu": [0, 0, 0, 0, 0, 0, 0, 0, 28, 38, 50, 62, 72, 80, 88],
-            "aio": [26, 26, 28, 30, 32, 34, 38, 42, 46, 50, 54, 58, 62, 66, 70],
-            "pump": [58, 58, 58, 58, 58, 60, 62, 64, 66, 68, 70, 72, 74, 76, 78],
-        }
-        for ch, old in old_silent_v2.items():
-            if copy_points(base["curves"]["silent"][ch]) == copy_points(old):
-                base["curves"]["silent"][ch] = list(PRESETS["silent"][ch])
-        old_silent_gpu_v3 = [0, 0, 0, 0, 0, 0, 0, 0, 31, 41, 53, 65, 75, 83, 91]
-        if copy_points(base["curves"]["silent"]["gpu"]) == copy_points(old_silent_gpu_v3):
-            base["curves"]["silent"]["gpu"] = list(PRESETS["silent"]["gpu"])
-        old_pumps = {
-            "silent": [
-                [50, 50, 50, 50, 50, 52, 54, 56, 58, 60, 62, 64, 66, 68, 70],
-                [58, 58, 58, 58, 58, 60, 62, 64, 66, 68, 70, 72, 74, 76, 78],
-                [61, 61, 61, 61, 61, 63, 65, 67, 69, 71, 73, 75, 77, 79, 81],
-            ],
-            "static": [[50] * POINT_COUNT],
-            "performance": [[50, 50, 52, 55, 58, 62, 68, 74, 80, 85, 90, 94, 96, 98, 100]],
-            "hell": [[60, 62, 65, 70, 75, 80, 85, 90, 94, 98, 100, 100, 100, 100, 100]],
-        }
-        for mode, olds in old_pumps.items():
-            cur = copy_points(base["curves"][mode]["pump"], PUMP_MIN)
-            if any(cur == copy_points(old, PUMP_MIN) for old in olds):
-                base["curves"][mode]["pump"] = list(PRESETS[mode]["pump"])
-        if copy_points(base["curves"]["custom"]["pump"], PUMP_MIN) == copy_points(old_pumps["performance"][0], PUMP_MIN):
-            base["curves"]["custom"]["pump"] = list(PRESETS["performance"]["pump"])
-        for ch in ("chassis", "gpu", "aio"):
-            if copy_points(base["curves"]["static"][ch]) in ([25] * POINT_COUNT, [40] * POINT_COUNT):
-                base["curves"]["static"][ch] = list(PRESETS["static"][ch])
         self.state = base
 
     def _save_now(self) -> None:
@@ -947,9 +1248,9 @@ class OmaFlow:
             self._chips_cached = hwmon_chips()
             self._chips_at = now
         self.chips = self._chips_cached
-        self.fan2go_installed = bool(which("fan2go"))
+        self.fan2go_installed = system_fan2go()
         self.liquidctl_installed = bool(liquidctl_bin())
-        self.helper_ready = HELPER_INSTALLED.is_file()
+        self.helper_ready = helper_trusted()
         self.fan2go_running = fan2go_api("/fan") is not None
         self.nvidia = nvidia_query()
         cpu = find_temp(self.chips, "k10temp", label_re=r"Tctl", index=1)
@@ -1003,6 +1304,8 @@ class OmaFlow:
                     item_kind = "pump"
                 elif kind == "aio" and re.search(r"fan", label, re.I):
                     item_kind = "aio"
+                elif kind == "chassis" and fan["has_pwm"] and is_cpu_fan_label(label):
+                    item_kind = "cpu"
                 fans.append({
                     "id": f"{chip['name']}_{fan['index']}",
                     "label": label,
@@ -1031,6 +1334,23 @@ class OmaFlow:
         else:
             self.tick_gpu()
         self.tick_pump()
+        self.tick_aio()
+
+    def sensor_of(self, channel: str) -> str:
+        sensors = self.state.get("sensors") or {}
+        value = sensors.get(channel)
+        if value in ("cpu", "liquid"):
+            return value
+        if channel == "pump" and self.state.get("pumpSensor") in ("cpu", "liquid"):
+            return self.state["pumpSensor"]
+        return "cpu"
+
+    def active_curve(self, mode: str, channel: str):
+        sensor = self.sensor_of(channel)
+        if channel in SENSOR_CHANNELS and sensor == "liquid":
+            return self.state["liquidCurves"][mode][channel], LIQUID_TEMPS
+        temps = GPU_TEMPS if channel == "gpu" else CPU_TEMPS
+        return self.state["curves"][mode][channel], temps
 
     def tick_gpu(self) -> None:
         if not self.state.get("gpuControl"):
@@ -1039,7 +1359,7 @@ class OmaFlow:
         if gpu is None:
             return
         mode = self.state["mode"]
-        duty = int(round(duty_at(self.state["curves"][mode]["gpu"], gpu)))
+        duty = int(round(duty_at(self.state["curves"][mode]["gpu"], gpu, GPU_TEMPS)))
         last = self._last_gpu_duty
         if last is not None:
             # Stay in auto until the curve reaches the 3090's ~30% floor.
@@ -1059,40 +1379,68 @@ class OmaFlow:
             self._last_gpu_duty = duty
             self._nvidia_manual = True
 
-    def tick_pump(self) -> None:
+    def _temp_for(self, channel: str):
+        sensor = self.sensor_of(channel)
+        if channel == "gpu":
+            return self.temps.get("gpu")
+        if sensor == "liquid":
+            return self.temps.get("coolant")
+        return self.temps.get("cpu")
+
+    def tick_fixed(self, channel: str, last_attr: str, hysteresis: int, minimum: int) -> None:
         if not self.liquidctl_installed:
             return
-        if self.state.get("pumpSensor", "cpu") != "cpu":
+        if self.sensor_of(channel) != "cpu":
             return
-        cpu = self.temps.get("cpu")
-        if cpu is None:
+        temp = self._temp_for(channel)
+        if temp is None:
             return
-        mode = self.state["mode"]
-        duty = int(round(duty_at(self.state["curves"][mode]["pump"], cpu)))
-        duty = max(PUMP_MIN, min(100, duty))
-        last = self._last_pump_duty
-        if last is not None and abs(duty - last) < 3:
+        points, temps = self.active_curve(self.state["mode"], channel)
+        duty = int(round(duty_at(points, temp, temps)))
+        duty = max(minimum, min(100, duty))
+        last = getattr(self, last_attr)
+        if last is not None and abs(duty - last) < hysteresis:
             return
-        if liquidctl_fixed_speed("pump", duty):
-            self._last_pump_duty = duty
+        liquid_channel = "pump" if channel == "pump" else "fan"
+        if liquidctl_fixed_speed(liquid_channel, duty):
+            setattr(self, last_attr, duty)
+
+    def tick_pump(self) -> None:
+        self.tick_fixed("pump", "_last_pump_duty", 3, PUMP_MIN)
+
+    def tick_aio(self) -> None:
+        if not self.state.get("aioFanControl"):
+            return
+        self.tick_fixed("aio", "_last_aio_duty", 3, 0)
+
+    def _write_kind(self, kind: str, duty: float) -> None:
+        pwm = int(round(clamp(duty, 0, 100) * 255 / 100.0))
+        for fan in self.fans:
+            if fan.get("kind") != kind or not fan.get("hwmon") or not fan.get("channel"):
+                continue
+            key = f"{fan['hwmon']}:{fan['channel']}"
+            last = self._last_pwm.get(key)
+            if last is not None and abs(pwm - last) < 8:
+                continue
+            if write_pwm_user_or_helper(fan["hwmon"], fan["channel"], pwm):
+                self._last_pwm[key] = pwm
 
     def tick_control(self) -> None:
         mode = self.state["mode"]
-        curves = self.state["curves"][mode]
         cpu = self.temps.get("cpu")
         if cpu is not None:
-            duty = duty_at(curves["chassis"], cpu)
+            duty = duty_at(self.state["curves"][mode]["chassis"], cpu, CPU_TEMPS)
             if mode != "silent":
                 duty = max(FAN_MIN, duty)
-            pwm = int(round(duty * 255 / 100.0))
-            for fan in self.fans:
-                if fan["kind"] == "chassis" and fan.get("hwmon") and fan.get("channel"):
-                    key = f"{fan['hwmon']}:{fan['channel']}"
-                    last = self._last_pwm.get(key)
-                    if last is not None and abs(pwm - last) < 8:
-                        continue
-                    if write_pwm_user_or_helper(fan["hwmon"], fan["channel"], pwm):
-                        self._last_pwm[key] = pwm
+            self._write_kind("chassis", duty)
+            if self.state.get("cpuControl"):
+                points, temps = self.active_curve(mode, "cpu")
+                source = self._temp_for("cpu")
+                if source is not None:
+                    cpu_duty = duty_at(points, source, temps)
+                    if mode != "silent":
+                        cpu_duty = max(FAN_MIN, cpu_duty)
+                    self._write_kind("cpu", cpu_duty)
         self.tick_gpu()
 
     def apply_now(self) -> None:
@@ -1104,7 +1452,7 @@ class OmaFlow:
         yaml_changed = yaml_text != self._last_yaml
         YAML_PATH.write_text(yaml_text, encoding="utf-8")
         if self.fan2go_installed and yaml_changed:
-            ok, msg = pkexec_helper("install-config", str(YAML_PATH))
+            ok, msg = pkexec_helper("install-config", yaml_text)
             if not ok:
                 errors.append("fan2go config: " + (msg or "failed"))
             else:
@@ -1118,11 +1466,14 @@ class OmaFlow:
             if not self._liquidctl_inited:
                 liquidctl_cmd("initialize", "all")
                 self._liquidctl_inited = True
-            if self.state.get("pumpSensor", "cpu") == "liquid":
-                if not liquidctl_profile("pump", curves["pump"], PUMP_MIN):
+            if self.sensor_of("pump") == "liquid":
+                pts, temps = self.active_curve(mode, "pump")
+                if not liquidctl_profile("pump", pts, temps, PUMP_MIN):
                     errors.append("AIO pump curve failed")
-            if self.state.get("aioFanControl"):
-                if not liquidctl_profile("fan", curves["aio"], FAN_MIN if mode != "silent" else 0):
+            if self.state.get("aioFanControl") and self.sensor_of("aio") == "liquid":
+                pts, temps = self.active_curve(mode, "aio")
+                floor = FAN_MIN if mode != "silent" else 0
+                if not liquidctl_profile("fan", pts, temps, floor):
                     errors.append("AIO fan curve failed")
             self.apply_lcd()
         if not self.state.get("gpuControl"):
@@ -1138,6 +1489,12 @@ class OmaFlow:
         else:
             self.tick_gpu()
         self.tick_pump()
+        self.tick_aio()
+        if self._release_cpu_fans:
+            self._release_cpu_fans = False
+            for fan in self.fans:
+                if fan.get("kind") == "cpu" and fan.get("hwmon") and fan.get("channel"):
+                    release_pwm_auto(fan["hwmon"], fan["channel"])
 
         self.apply_error = "; ".join(errors)
         if self.apply_error:
@@ -1263,7 +1620,15 @@ class OmaFlow:
             "presetsLocked": self.state.get("presetsLocked", True) is not False,
             "gpuControl": self.state.get("gpuControl") is True,
             "aioFanControl": self.state.get("aioFanControl") is True,
-            "pumpSensor": self.state.get("pumpSensor") or "cpu",
+            "cpuControl": self.state.get("cpuControl") is True,
+            "cpuFanPresent": any(f.get("kind") == "cpu" for f in self.fans),
+            "sensors": {
+                "pump": self.sensor_of("pump"),
+                "aio": self.sensor_of("aio"),
+                "cpu": self.sensor_of("cpu"),
+            },
+            "pumpSensor": self.sensor_of("pump"),
+            "notice": self.notice,
             "locked": self.is_locked(),
             "selectedChannel": self.state["selectedChannel"],
             "temps": self.temps,
@@ -1290,11 +1655,118 @@ class OmaFlow:
         }
         if not telemetry:
             payload["curves"] = self.state["curves"]
-            payload["tempsAxis"] = TEMPS
+            payload["liquidCurves"] = self.state.get("liquidCurves") or {}
+            payload["tempsAxis"] = CPU_TEMPS
         return payload
 
     def emit_state(self, telemetry=False) -> None:
         emit(self.snapshot(telemetry=telemetry))
+
+    def _store_curve(self, mode: str, channel: str, points) -> None:
+        if channel in SENSOR_CHANNELS and self.sensor_of(channel) == "liquid":
+            self.state["liquidCurves"][mode][channel] = list(points)
+        else:
+            self.state["curves"][mode][channel] = list(points)
+
+    def _set_sensor(self, channel: str, sensor: str) -> None:
+        if channel not in SENSOR_CHANNELS or sensor not in ("cpu", "liquid"):
+            return
+        self.state.setdefault("sensors", {})[channel] = sensor
+        if channel == "pump":
+            self.state["pumpSensor"] = sensor
+            self._last_pump_duty = None
+        if channel == "aio":
+            self._last_aio_duty = None
+        self.save_state()
+        self.schedule_apply()
+        self.emit_state()
+
+    def _export_settings(self, raw_path: str) -> None:
+        path = settings_path(raw_path)
+        if path is None:
+            self.notice = ""
+            self.last_error = "export path must be a .json file inside your home directory"
+            self.emit_state()
+            return
+        doc = {
+            "format": "omaflow-settings",
+            "version": 1,
+            "mode": self.state["mode"],
+            "presetsLocked": self.state.get("presetsLocked", True) is not False,
+            "locks": self.state.get("locks") or {},
+            "gpuControl": self.state.get("gpuControl") is True,
+            "aioFanControl": self.state.get("aioFanControl") is True,
+            "cpuControl": self.state.get("cpuControl") is True,
+            "sensors": {
+                "pump": self.sensor_of("pump"),
+                "aio": self.sensor_of("aio"),
+                "cpu": self.sensor_of("cpu"),
+            },
+            "curves": self.state.get("curves") or {},
+            "liquidCurves": self.state.get("liquidCurves") or {},
+            "lcdMode": self.state.get("lcdMode"),
+            "lcdBrightness": self.state.get("lcdBrightness"),
+            "themeSync": self.state.get("themeSync") is True,
+        }
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+        except OSError as exc:
+            self.notice = ""
+            self.last_error = "export failed: " + str(exc)
+            self.emit_state()
+            return
+        self.last_error = ""
+        self.notice = "Exported settings to " + str(path)
+        self.emit_state()
+
+    def _import_settings(self, raw_path: str) -> None:
+        path = settings_path(raw_path)
+        if path is None or not path.is_file():
+            self.notice = ""
+            self.last_error = "import path must be an existing .json file inside your home directory"
+            self.emit_state()
+            return
+        try:
+            doc = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            self.notice = ""
+            self.last_error = "import failed: " + str(exc)
+            self.emit_state()
+            return
+        if not isinstance(doc, dict) or doc.get("format") != "omaflow-settings":
+            self.notice = ""
+            self.last_error = "that file is not an OmaFlow settings export"
+            self.emit_state()
+            return
+        base = default_state()
+        base["accent"] = self.state.get("accent") or ""
+        base["selectedChannel"] = self.state.get("selectedChannel") or "chassis"
+        doc["axisVersion"] = 2
+        load_current_curves(doc, base)
+        for key in ("gpuControl", "aioFanControl", "cpuControl", "themeSync"):
+            if key in doc:
+                base[key] = bool(doc[key])
+        if "presetsLocked" in doc:
+            base["presetsLocked"] = bool(doc["presetsLocked"])
+            for m in ("silent", "static", "performance", "hell"):
+                base["locks"][m] = base["presetsLocked"]
+        if doc.get("mode") in MODES:
+            base["mode"] = doc["mode"]
+        if doc.get("lcdMode") in ("liquid", "accent", "off"):
+            base["lcdMode"] = doc["lcdMode"]
+        if "lcdBrightness" in doc:
+            base["lcdBrightness"] = int(clamp(doc["lcdBrightness"], 0, 100))
+        self.state = base
+        self._last_pump_duty = None
+        self._last_aio_duty = None
+        self._last_yaml = ""
+        self.notice = "Imported settings from " + path.name
+        self.last_error = ""
+        self._curve_rev += 1
+        self.save_state()
+        self.schedule_apply()
+        self.emit_state()
 
     def handle(self, msg: dict) -> None:
         op = msg.get("op")
@@ -1334,25 +1806,25 @@ class OmaFlow:
             return
         if op == "set_gpu_control":
             self.state["gpuControl"] = bool(msg.get("enabled", False))
-            if not self.state["gpuControl"] and self.state.get("selectedChannel") == "gpu":
-                self.state["selectedChannel"] = "chassis"
+            self.save_state()
+            self.schedule_apply()
+            self.emit_state()
+            return
+        if op == "set_cpu_control":
+            enabled = bool(msg.get("enabled", False))
+            if self.state.get("cpuControl") and not enabled:
+                self._release_cpu_fans = True
+            self.state["cpuControl"] = enabled
             self.save_state()
             self.schedule_apply()
             self.emit_state()
             return
         if op == "set_pump_sensor":
-            sensor = str(msg.get("sensor") or "")
-            if sensor in ("cpu", "liquid"):
-                self.state["pumpSensor"] = sensor
-                self._last_pump_duty = None
-                self.save_state()
-                self.schedule_apply()
-                self.emit_state()
+            self._set_sensor(str(msg.get("channel") or "pump"), str(msg.get("sensor") or ""))
             return
         if op == "set_aio_fan_control":
             self.state["aioFanControl"] = bool(msg.get("enabled", False))
-            if not self.state["aioFanControl"] and self.state.get("selectedChannel") == "aio":
-                self.state["selectedChannel"] = "chassis"
+            self._last_aio_duty = None
             self.save_state()
             self.schedule_apply()
             self.emit_state()
@@ -1369,20 +1841,17 @@ class OmaFlow:
             ch = str(msg.get("channel") or self.state["selectedChannel"])
             idx = int(msg.get("index", -1))
             if mode == "custom" or not self.is_locked(mode):
-                if mode in MODES and ch in CHANNELS and 0 <= idx < POINT_COUNT:
-                    minimum = PUMP_MIN if ch == "pump" else 0
-                    pts = apply_monotonic(
-                        self.state["curves"][mode][ch],
-                        idx,
-                        msg.get("value"),
-                        minimum,
-                    )
-                    if ch == "pump":
-                        pts = enforce_min(pts, PUMP_MIN)
-                    self.state["curves"][mode][ch] = pts
-                    self._curve_rev += 1
-                    self.save_state(immediate=False)
-                    self.emit_state()
+                if mode in MODES and ch in CHANNELS:
+                    points, temps = self.active_curve(mode, ch)
+                    if 0 <= idx < len(temps):
+                        minimum = PUMP_MIN if ch == "pump" else 0
+                        pts = apply_monotonic(points, idx, msg.get("value"), minimum, len(temps))
+                        if ch == "pump":
+                            pts = [max(PUMP_MIN, int(v)) for v in pts]
+                        self._store_curve(mode, ch, pts)
+                        self._curve_rev += 1
+                        self.save_state(immediate=False)
+                        self.emit_state()
             return
         if op == "apply":
             self.apply_now()
@@ -1398,11 +1867,22 @@ class OmaFlow:
             if mode in MODES and ch in CHANNELS and src_mode in PRESETS:
                 if mode == "custom" or not self.is_locked(mode):
                     minimum = PUMP_MIN if ch == "pump" else 0
-                    self.state["curves"][mode][ch] = copy_points(PRESETS[src_mode][ch], minimum)
+                    if ch in SENSOR_CHANNELS and self.sensor_of(ch) == "liquid":
+                        pts = copy_points(LIQUID_PRESETS[src_mode][ch], minimum, len(LIQUID_TEMPS))
+                    else:
+                        temps = GPU_TEMPS if ch == "gpu" else CPU_TEMPS
+                        pts = copy_points(PRESETS[src_mode][ch], minimum, len(temps))
+                    self._store_curve(mode, ch, pts)
                     self._curve_rev += 1
                     self.save_state()
                     self.schedule_apply()
                     self.emit_state()
+            return
+        if op == "export_settings":
+            self._export_settings(str(msg.get("path") or ""))
+            return
+        if op == "import_settings":
+            self._import_settings(str(msg.get("path") or ""))
             return
         if op == "set_lcd":
             mode = str(msg.get("mode") or "")
@@ -1458,7 +1938,7 @@ def main() -> None:
     app = OmaFlow()
     emit({
         "event": "hello",
-        "fan2go": which("fan2go"),
+        "fan2go": str(FAN2GO_BIN) if system_fan2go() else None,
         "liquidctl": liquidctl_bin(),
         "helper": helper_bin(),
     })
@@ -1470,9 +1950,9 @@ def main() -> None:
                 if "gpu_fan" in existing:
                     app.schedule_apply()
             if app.liquidctl_installed:
-                if app.state.get("pumpSensor", "cpu") == "liquid":
-                    curves = app.state["curves"][app.state["mode"]]
-                    if liquidctl_profile("pump", curves["pump"], PUMP_MIN):
+                if app.sensor_of("pump") == "liquid":
+                    pts, temps = app.active_curve(app.state["mode"], "pump")
+                    if liquidctl_profile("pump", pts, temps, PUMP_MIN):
                         app.apply_error = ""
                 else:
                     app.tick_pump()

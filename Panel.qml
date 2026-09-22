@@ -1,12 +1,12 @@
 import QtQuick
+import QtQuick.Dialogs
 import Quickshell.Io
 import qs.Commons
 import qs.Ui
 import "Model.js" as Model
 
-// OmaFlow bar chip + popup. Monitor tab for CPU/GPU/AIO temps, Curves tab
-// for the five cooling modes and the CAM-style graph. The bridge in
-// Service.qml owns fan2go + liquidctl; this file is the shell.
+// OmaFlow bar chip + popup. Telemetry shows temps. Settings edits curves.
+// The bridge in Service.qml owns fan2go + liquidctl; this file is the shell.
 Panel {
   id: root
   moduleName: "tempest-chaoscreator.omaflow"
@@ -22,9 +22,14 @@ Panel {
   readonly property bool presetsLocked: service ? service.presetsLocked !== false : true
   readonly property bool gpuControl: service ? service.gpuControl === true : false
   readonly property bool aioFanControl: service ? service.aioFanControl === true : false
+  readonly property bool cpuControl: service ? service.cpuControl === true : false
+  readonly property bool cpuFanPresent: service ? service.cpuFanPresent === true : false
+  readonly property var sensors: service && service.sensors ? service.sensors : ({})
+  readonly property var liquidCurves: service && service.liquidCurves ? service.liquidCurves : ({})
   readonly property string pumpSensor: service && service.pumpSensor === "liquid" ? "liquid" : "cpu"
+  readonly property string notice: service ? String(service.notice || "") : ""
   readonly property bool curveLocked: service ? service.locked === true : true
-  readonly property bool channelLive: Model.channelEnabled(selectedChannel, gpuControl, aioFanControl)
+  readonly property bool channelLive: Model.channelEnabled(selectedChannel, gpuControl, aioFanControl, cpuControl, cpuFanPresent)
   readonly property var curves: service && service.curves ? service.curves : ({})
   readonly property string selectedChannel: service ? String(service.selectedChannel) : "chassis"
   readonly property var temps: service && service.temps ? service.temps : ({})
@@ -63,20 +68,18 @@ Panel {
     { value: "hell", label: "Hell" }
   ]
   readonly property var channelOptions: {
-    var gpuOn = root.gpuControl
-    var aioOn = root.aioFanControl
+    var _flags = (root.gpuControl ? 1 : 0) + (root.aioFanControl ? 2 : 0) + (root.cpuControl ? 4 : 0) + (root.cpuFanPresent ? 8 : 0)
     var all = [
-      { value: "chassis", label: "Chassis" },
+      { value: "chassis", label: "Chassis", flags: _flags },
       { value: "pump", label: "Pump" },
+      { value: "cpu", label: "CPU" },
       { value: "aio", label: "AIO" },
       { value: "gpu", label: "GPU" }
     ]
     var live = []
     var dead = []
     for (var i = 0; i < all.length; i++) {
-      var id = all[i].value
-      var on = (id === "gpu") ? gpuOn : (id === "aio") ? aioOn : true
-      if (on) live.push(all[i])
+      if (root.channelIsLive(all[i].value)) live.push(all[i])
       else dead.push(all[i])
     }
     return live.concat(dead)
@@ -87,17 +90,27 @@ Panel {
     { value: "off", label: "Off" }
   ]
 
+  function channelSensor(id) {
+    if (!Model.hasSensor(id)) return "cpu"
+    var stored = sensors ? sensors[id] : ""
+    if (stored === "liquid" || stored === "cpu") return stored
+    if (id === "pump") return pumpSensor
+    if (id === "aio") return "liquid"
+    return "cpu"
+  }
+
+  readonly property string selectedSensor: channelSensor(selectedChannel)
+  readonly property var graphTemps: Model.axisFor(selectedChannel, selectedSensor)
   readonly property var activePoints: {
     var rev = service ? service.curveRev : 0
-    var all = curves[viewMode]
-    if (!all) return []
-    return Model.copyPoints(all[selectedChannel] || [], Model.channelMin(selectedChannel))
+    var table = (selectedSensor === "liquid" && Model.hasSensor(selectedChannel)) ? liquidCurves : curves
+    var all = table[viewMode]
+    var src = all ? (all[selectedChannel] || []) : []
+    return Model.copyPoints(src, Model.channelMin(selectedChannel), graphTemps.length)
   }
   readonly property real channelTemp: {
     if (selectedChannel === "gpu") return Number(temps.gpu)
-    if (selectedChannel === "aio") return Number(temps.coolant)
-    if (selectedChannel === "pump")
-      return pumpSensor === "liquid" ? Number(temps.coolant) : Number(temps.cpu)
+    if (selectedSensor === "liquid") return Number(temps.coolant)
     return Number(temps.cpu)
   }
 
@@ -123,6 +136,8 @@ Panel {
 
   readonly property string tooltip: "OmaFlow · " + Model.modeLabel(mode) + " · " + Model.formatTemp(hottest)
   readonly property string setupPath: Qt.resolvedUrl("setup").toString().replace(/^file:\/\//, "")
+  readonly property string headerAioHint: "One-cable AIOs (Arctic and similar) use a single CPU_FAN lead.\nTurn the CPU toggle off and let the BIOS run that header,\nor split the cable: pump to AIO_PUMP, radiator fans to CPU_FAN."
+  readonly property string fansOnlyHint: "Fans only skips liquidctl.\nUse it when the cooler has no USB connection."
 
   function persistSettings(values) {
     var entry = { id: root.moduleName }
@@ -143,8 +158,22 @@ Panel {
   Component.onCompleted: pushSettings()
 
   function installStack() {
+    runSetup("")
+  }
+
+  function installFansOnly() {
+    runSetup(" --fans-only")
+  }
+
+  function runSetup(extra) {
     if (bar && typeof bar.run === "function")
-      bar.run("omarchy-launch-floating-terminal-with-presentation \"bash '" + setupPath + "'\"")
+      bar.run("omarchy-launch-floating-terminal-with-presentation \"bash '" + setupPath + "'" + extra + "\"")
+  }
+
+  function fileUrl(value) {
+    var s = String(value || "")
+    if (s.indexOf("file://") === 0) s = decodeURIComponent(s.slice(7))
+    return s
   }
 
   function setMode(id) {
@@ -186,8 +215,36 @@ Panel {
     persistSettings({ aioFanControl: on })
   }
 
+  function toggleCpuControl() {
+    if (!service || !root.cpuFanPresent) return
+    var on = !root.cpuControl
+    service.setCpuControl(on)
+    persistSettings({ cpuControl: on })
+  }
+
+  function toggleChannel(id) {
+    if (id === "gpu") root.toggleGpuControl()
+    else if (id === "aio") root.toggleAioFanControl()
+    else if (id === "cpu") root.toggleCpuControl()
+  }
+
   function channelIsLive(id) {
-    return Model.channelEnabled(id, root.gpuControl, root.aioFanControl)
+    return Model.channelEnabled(id, root.gpuControl, root.aioFanControl, root.cpuControl, root.cpuFanPresent)
+  }
+
+  function channelTip(id) {
+    if (id === "gpu" && !root.gpuControl) return "GPU fans stay on NVIDIA's curve until you turn this on"
+    if (id === "aio" && !root.aioFanControl) return "AIO radiator fans stay unmanaged until you turn this on"
+    if (id === "cpu" && !root.cpuFanPresent) return "No CPU fan header detected"
+    if (id === "cpu" && !root.cpuControl) return "CPU fan stays on the BIOS curve until you turn this on"
+    return Model.channelLabel(id)
+  }
+
+  function channelOverlay() {
+    if (root.selectedChannel === "gpu") return "controlled by the GPU"
+    if (root.selectedChannel === "cpu")
+      return root.cpuFanPresent ? "controlled by the BIOS" : "no CPU fan detected"
+    return "not active"
   }
 
   function setTab(id) {
@@ -271,7 +328,7 @@ Panel {
         else if (t === "4") root.pickMode("hell")
         else if (t === "5") root.pickMode("custom")
         else if (t === "m" || t === "M") root.setTab("monitor")
-        else if (t === "c" || t === "C") root.setTab("curves")
+        else if (t === "c" || t === "C" || t === "s" || t === "S") root.setTab("curves")
         else if (t === "r" || t === "R") { if (root.service) root.service.refresh() }
       }
 
@@ -377,7 +434,7 @@ Panel {
 
             Button {
               width: (parent.width - parent.spacing) / 2
-              text: "Curves"
+              text: "Settings"
               selected: root.tab === "curves"
               bordered: true
               foreground: root.fg
@@ -388,6 +445,17 @@ Panel {
               verticalPadding: Style.space(8)
               onClicked: root.setTab("curves")
             }
+          }
+
+          Text {
+            width: parent.width
+            wrapMode: Text.WordWrap
+            text: root.tab === "monitor"
+              ? "This page displays information and lets you select modes"
+              : "This page only edits curves and settings"
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
           }
 
           Row {
@@ -471,8 +539,40 @@ Panel {
               bordered: true
               foreground: root.fg
               fontFamily: root.fontFamily
-              tooltipText: "Opens a terminal and runs the plugin setup script (liquidctl, fan2go, polkit helper)"
+              tooltipText: "Opens a terminal and runs setup. Installs liquidctl and the helper. fan2go must already be installed."
               onClicked: root.installStack()
+            }
+
+            Text {
+              width: parent.width
+              wrapMode: Text.WordWrap
+              text: "A cooler that plugs into motherboard headers instead of USB does not need liquidctl."
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            Row {
+              spacing: Style.space(6)
+
+              Button {
+                text: "Install fan control only"
+                bordered: true
+                foreground: root.fg
+                fontFamily: root.fontFamily
+                fontSize: Style.font.caption
+                horizontalPadding: Style.space(10)
+                verticalPadding: Style.space(6)
+                tooltipText: "Installs the helper and skips liquidctl. fan2go must already be installed."
+                onClicked: root.installFansOnly()
+              }
+
+              PanelActionButton {
+                anchors.verticalCenter: parent.verticalCenter
+                iconText: "\u{f05a}"
+                foreground: root.fg
+                tooltipText: root.headerAioHint + "\n\n" + root.fansOnlyHint
+              }
             }
           }
 
@@ -630,86 +730,120 @@ Panel {
             }
           }
 
-          // ---------- Curves ----------
+          // ---------- Settings ----------
           Column {
             visible: root.tab === "curves"
             width: parent.width
             spacing: Style.space(10)
 
-            Text {
-              width: parent.width
-              wrapMode: Text.Wrap
-              text: "This page only edits stored curves"
-              color: root.dim
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-            }
-
             Item {
               width: parent.width
-              implicitHeight: Math.max(channelFlow.implicitHeight, resetBtn.implicitHeight)
+              implicitHeight: Math.max(channelFlow.implicitHeight, resetRow.implicitHeight)
 
               Flow {
                 id: channelFlow
                 anchors.left: parent.left
-                anchors.right: resetBtn.left
+                anchors.right: resetRow.left
                 anchors.rightMargin: Style.space(8)
                 spacing: Style.space(6)
 
                 Repeater {
                   model: root.channelOptions
-                  Row {
+                  BorderSurface {
+                    id: chip
                     required property var modelData
-                    spacing: Style.space(2)
+                    readonly property bool togglable: modelData.value === "gpu" || modelData.value === "aio" || modelData.value === "cpu"
+                    readonly property bool canToggle: modelData.value !== "cpu" || root.cpuFanPresent
+                    readonly property bool expanded: togglable && canToggle && root.selectedChannel === modelData.value
+                    readonly property int padX: Style.space(10)
+                    readonly property int padY: Style.space(6)
+                    property real targetWidth: expanded
+                      ? chipLabel.implicitWidth + Style.space(8) + chipSwitch.implicitWidth + padX * 2
+                      : chipLabel.implicitWidth + padX * 2
+                    width: targetWidth
+                    implicitHeight: Math.max(chipLabel.implicitHeight, Style.space(18)) + padY * 2
+                    height: implicitHeight
+                    radius: Style.cornerRadius
                     opacity: root.channelIsLive(modelData.value) ? 1 : 0.45
+                    color: root.selectedChannel === modelData.value
+                      ? Style.selectedFillFor(root.fg, root.accent)
+                      : (chipMouse.containsMouse ? Style.hoverFillFor(root.fg, root.accent) : "transparent")
+                    borderSpec: Border.controlSpec("normal", root.fg, root.accent)
+                    Behavior on width { NumberAnimation { duration: 180; easing.type: Easing.OutCubic } }
 
-                    Button {
+                    Text {
+                      id: chipLabel
+                      anchors.left: parent.left
+                      anchors.leftMargin: chip.padX
+                      anchors.verticalCenter: parent.verticalCenter
                       text: modelData.label
-                      selected: root.selectedChannel === modelData.value
-                      bordered: true
+                      color: root.fg
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
+                    }
+
+                    ToggleSwitch {
+                      id: chipSwitch
+                      anchors.left: chipLabel.right
+                      anchors.leftMargin: Style.space(8)
+                      anchors.verticalCenter: parent.verticalCenter
+                      visible: chip.expanded
+                      opacity: chip.expanded ? 1 : 0
+                      checked: root.channelIsLive(modelData.value)
+                      trackHeight: Math.max(14, Style.space(16))
                       foreground: root.fg
                       accent: root.accent
-                      fontFamily: root.fontFamily
-                      fontSize: Style.font.caption
-                      tooltipText: !root.channelIsLive(modelData.value)
-                        ? (modelData.value === "gpu"
-                          ? "GPU fans stay on NVIDIA's curve until you unlock this"
-                          : "AIO radiator fans stay unmanaged until you unlock this")
-                        : Model.channelLabel(modelData.value)
+                      onToggled: root.toggleChannel(modelData.value)
+                      Behavior on opacity { NumberAnimation { duration: 140 } }
+                    }
+
+                    MouseArea {
+                      id: chipMouse
+                      anchors.left: parent.left
+                      anchors.top: parent.top
+                      anchors.bottom: parent.bottom
+                      width: chip.expanded ? chipLabel.implicitWidth + chip.padX + Style.space(8) : parent.width
+                      hoverEnabled: true
+                      cursorShape: Qt.PointingHandCursor
                       onClicked: root.setChannel(modelData.value)
                     }
 
-                    PanelActionButton {
-                      visible: modelData.value === "gpu" || modelData.value === "aio"
-                      anchors.verticalCenter: parent.verticalCenter
-                      iconText: root.channelIsLive(modelData.value) ? "\u{f1a25}" : "\u{f1a26}"
-                      foreground: root.fg
-                      tooltipText: modelData.value === "gpu"
-                        ? (root.gpuControl ? "Return GPU fans to NVIDIA" : "Let OmaFlow drive the GPU fans")
-                        : (root.aioFanControl ? "Stop driving AIO radiator fans" : "Drive fans plugged into the AIO")
-                      onClicked: {
-                        if (modelData.value === "gpu") root.toggleGpuControl()
-                        else root.toggleAioFanControl()
-                      }
+                    PanelToolTip {
+                      visible: chipMouse.containsMouse
+                      text: root.channelTip(modelData.value)
+                      fontFamily: root.fontFamily
                     }
                   }
                 }
               }
 
-              Button {
-                id: resetBtn
+              Row {
+                id: resetRow
                 anchors.right: parent.right
                 anchors.verticalCenter: parent.verticalCenter
-                text: "Reset"
-                bordered: true
-                enabled: root.graphInteractive
-                foreground: root.fg
-                fontFamily: root.fontFamily
-                fontSize: Style.font.caption
-                tooltipText: !root.channelLive
-                  ? "Unlock this channel to edit its curve"
-                  : (root.viewLocked ? "Unlock the presets, or switch to Custom" : "Restore the factory curve for " + Model.channelLabel(root.selectedChannel) + " only")
-                onClicked: if (root.service) root.service.resetCurve(root.viewMode)
+                spacing: Style.space(4)
+
+                Button {
+                  id: resetBtn
+                  text: "Reset"
+                  bordered: true
+                  enabled: root.graphInteractive
+                  foreground: root.fg
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.caption
+                  tooltipText: !root.channelLive
+                    ? "Unlock this channel to edit its curve"
+                    : (root.viewLocked ? "Unlock the presets, or switch to Custom" : "Restore the factory curve for " + Model.channelLabel(root.selectedChannel) + " only")
+                  onClicked: if (root.service) root.service.resetCurve(root.viewMode)
+                }
+
+                PanelActionButton {
+                  anchors.verticalCenter: parent.verticalCenter
+                  iconText: "\u{f05a}"
+                  foreground: root.fg
+                  tooltipText: root.headerAioHint
+                }
               }
             }
 
@@ -731,7 +865,7 @@ Panel {
                 anchors.fill: parent
                 opacity: root.channelLive ? 1 : 0.28
                 points: root.activePoints
-                temps: root.tempsAxis
+                temps: root.graphTemps
                 currentTemp: root.channelTemp
                 interactive: root.graphInteractive
                 minDuty: root.channelMin
@@ -749,7 +883,7 @@ Panel {
 
                 Text {
                   anchors.horizontalCenter: parent.horizontalCenter
-                  text: root.selectedChannel === "gpu" ? "controlled by the GPU" : "not active"
+                  text: root.channelOverlay()
                   color: root.fg
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.title
@@ -758,16 +892,12 @@ Panel {
 
                 Button {
                   anchors.horizontalCenter: parent.horizontalCenter
-                  visible: root.selectedChannel === "gpu" || root.selectedChannel === "aio"
+                  visible: root.selectedChannel === "gpu" || root.selectedChannel === "aio" || (root.selectedChannel === "cpu" && root.cpuFanPresent)
                   text: "Enable"
-                  iconText: "\u{f1a26}"
                   bordered: true
                   foreground: root.fg
                   fontFamily: root.fontFamily
-                  onClicked: {
-                    if (root.selectedChannel === "gpu") root.toggleGpuControl()
-                    else root.toggleAioFanControl()
-                  }
+                  onClicked: root.toggleChannel(root.selectedChannel)
                 }
               }
             }
@@ -776,16 +906,17 @@ Panel {
               width: parent.width
               text: Model.channelLabel(root.selectedChannel) + "  ·  " + Model.modeLabel(root.viewMode)
                     + (isFinite(root.channelTemp) ? "  ·  now " + Model.formatTemp(root.channelTemp) : "")
-                    + (root.selectedChannel === "pump"
-                      ? (root.pumpSensor === "liquid" ? "  ·  liquid" : "  ·  CPU") + "  ·  floor 50%"
+                    + (Model.hasSensor(root.selectedChannel)
+                      ? (root.selectedSensor === "liquid" ? "  ·  liquid" : "  ·  CPU")
                       : "")
+                    + (root.selectedChannel === "pump" ? "  ·  floor 50%" : "")
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
             }
 
             Row {
-              visible: root.selectedChannel === "pump"
+              visible: Model.hasSensor(root.selectedChannel)
               width: parent.width
               spacing: Style.space(8)
 
@@ -799,13 +930,13 @@ Panel {
 
               ButtonGroup {
                 options: root.pumpSensorOptions
-                value: root.pumpSensor
+                value: root.selectedSensor
                 foreground: root.fg
                 accent: root.accent
                 fontFamily: root.fontFamily
                 fontSize: Style.font.caption
                 focusable: false
-                onChanged: function(v) { if (root.service) root.service.setPumpSensor(v) }
+                onChanged: function(v) { if (root.service) root.service.setChannelSensor(root.selectedChannel, v) }
               }
             }
 
@@ -892,9 +1023,79 @@ Panel {
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
             }
+
+            PanelSeparator { foreground: root.fg }
+
+            PanelSectionHeader {
+              text: "Save and restore"
+              foreground: root.fg
+              fontFamily: root.fontFamily
+            }
+
+            Text {
+              width: parent.width
+              wrapMode: Text.WordWrap
+              text: "Export the curves and settings stored here, or import a file you saved earlier. Import replaces the curves on this machine."
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            Row {
+              spacing: Style.space(8)
+
+              Button {
+                text: "Export"
+                bordered: true
+                foreground: root.fg
+                fontFamily: root.fontFamily
+                fontSize: Style.font.caption
+                onClicked: exportDialog.open()
+              }
+
+              Button {
+                text: "Import"
+                bordered: true
+                foreground: root.fg
+                fontFamily: root.fontFamily
+                fontSize: Style.font.caption
+                onClicked: importDialog.open()
+              }
+            }
+
+            Text {
+              width: parent.width
+              wrapMode: Text.WordWrap
+              visible: root.notice !== ""
+              text: root.notice
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
           }
         }
       }
+    }
+  }
+
+  FileDialog {
+    id: exportDialog
+    title: "Export OmaFlow settings"
+    fileMode: FileDialog.SaveFile
+    nameFilters: ["OmaFlow settings (*.json)"]
+    defaultSuffix: "json"
+    onAccepted: {
+      if (root.service) root.service.exportSettings(root.fileUrl(selectedFile))
+    }
+  }
+
+  FileDialog {
+    id: importDialog
+    title: "Import OmaFlow settings"
+    fileMode: FileDialog.OpenFile
+    nameFilters: ["OmaFlow settings (*.json)"]
+    onAccepted: {
+      if (root.service) root.service.importSettings(root.fileUrl(selectedFile))
     }
   }
 }

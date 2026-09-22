@@ -1,10 +1,17 @@
 .pragma library
 
-var TEMPS = [20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90]
+// CPU-temperature graphs: 28–98 °C, 15 columns, 5 °C apart.
+var CPU_TEMPS = [28, 33, 38, 43, 48, 53, 58, 63, 68, 73, 78, 83, 88, 93, 98]
+// GPU keeps the 20–90 axis the Silent handoff was tuned on.
+var GPU_TEMPS = [20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90]
+// Coolant graphs stop at 60 °C. 2 °C columns so the 34–38 °C band is editable.
+var LIQUID_TEMPS = [28, 30, 32, 34, 36, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60]
+var TEMPS = CPU_TEMPS
 var POINT_COUNT = 15
 var FAN_MIN = 20
 var PUMP_MIN = 50
-var CHANNELS = ["chassis", "gpu", "aio", "pump"]
+var CHANNELS = ["chassis", "cpu", "gpu", "aio", "pump"]
+var SENSOR_CHANNELS = ["pump", "aio", "cpu"]
 var MODES = ["silent", "static", "performance", "hell", "custom"]
 
 function clamp(v, lo, hi) {
@@ -84,6 +91,7 @@ function modeLabel(id) {
 function channelLabel(id) {
   switch (String(id)) {
   case "chassis": return "Chassis"
+  case "cpu": return "CPU"
   case "gpu": return "GPU"
   case "aio": return "AIO"
   case "pump": return "Pump"
@@ -95,12 +103,24 @@ function channelMin(id) {
   return String(id) === "pump" ? PUMP_MIN : 0
 }
 
-function copyPoints(points, minDuty) {
+function hasSensor(id) {
+  return SENSOR_CHANNELS.indexOf(String(id)) !== -1
+}
+
+function axisFor(channel, sensor) {
+  if (String(channel) === "gpu") return GPU_TEMPS
+  if (hasSensor(channel) && String(sensor) === "liquid") return LIQUID_TEMPS
+  return CPU_TEMPS
+}
+
+function copyPoints(points, minDuty, count) {
   var lo = minDuty === undefined ? 0 : Number(minDuty)
   if (!isFinite(lo)) lo = 0
-  var out = []
   var src = Array.isArray(points) ? points : []
-  for (var i = 0; i < POINT_COUNT; i++) {
+  var n = Number(count)
+  if (!(n >= 2)) n = src.length >= 2 ? src.length : POINT_COUNT
+  var out = []
+  for (var i = 0; i < n; i++) {
     var v = i < src.length ? Number(src[i]) : lo
     out.push(clamp(isFinite(v) ? v : lo, lo, 100))
   }
@@ -113,39 +133,42 @@ function copyPoints(points, minDuty) {
 function applyMonotonic(points, index, value, minDuty) {
   var lo = minDuty === undefined ? 0 : Number(minDuty)
   if (!isFinite(lo)) lo = 0
-  var pts = copyPoints(points, lo)
+  var src = Array.isArray(points) ? points : []
+  var n = src.length >= 2 ? src.length : POINT_COUNT
+  var pts = copyPoints(src, lo, n)
   var i = Math.round(Number(index))
-  if (!(i >= 0 && i < POINT_COUNT)) return pts
+  if (!(i >= 0 && i < n)) return pts
   var v = clamp(value, lo, 100)
   pts[i] = v
   var j
-  for (j = i + 1; j < POINT_COUNT; j++) {
+  for (j = i + 1; j < n; j++) {
     if (pts[j] < v) pts[j] = v
   }
   for (j = i - 1; j >= 0; j--) {
     if (pts[j] > v) pts[j] = v
   }
-  for (j = 0; j < POINT_COUNT; j++) {
+  for (j = 0; j < n; j++) {
     if (pts[j] < lo) pts[j] = lo
   }
   return pts
 }
 
-function dutyAt(points, temp) {
-  var pts = copyPoints(points)
+function dutyAt(points, temp, temps) {
+  var axis = (temps && temps.length >= 2) ? temps : TEMPS
+  var pts = copyPoints(points, 0, axis.length)
   var t = Number(temp)
-  if (!isFinite(t)) t = TEMPS[0]
-  if (t <= TEMPS[0]) return pts[0]
-  if (t >= TEMPS[POINT_COUNT - 1]) return pts[POINT_COUNT - 1]
-  for (var i = 0; i < POINT_COUNT - 1; i++) {
-    var a = TEMPS[i]
-    var b = TEMPS[i + 1]
+  if (!isFinite(t)) t = axis[0]
+  if (t <= axis[0]) return pts[0]
+  if (t >= axis[axis.length - 1]) return pts[axis.length - 1]
+  for (var i = 0; i < axis.length - 1; i++) {
+    var a = axis[i]
+    var b = axis[i + 1]
     if (t >= a && t <= b) {
       var u = (t - a) / (b - a)
       return pts[i] + (pts[i + 1] - pts[i]) * u
     }
   }
-  return pts[POINT_COUNT - 1]
+  return pts[pts.length - 1]
 }
 
 function isLocked(locks, mode) {
@@ -155,9 +178,10 @@ function isLocked(locks, mode) {
   return locks[String(mode)] !== false
 }
 
-function channelEnabled(id, gpuControl, aioFanControl) {
+function channelEnabled(id, gpuControl, aioFanControl, cpuControl, cpuPresent) {
   if (id === "gpu") return gpuControl === true
   if (id === "aio") return aioFanControl === true
+  if (id === "cpu") return cpuControl === true && cpuPresent === true
   return true
 }
 

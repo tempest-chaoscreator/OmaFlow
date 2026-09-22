@@ -21,7 +21,12 @@ Item {
   property bool presetsLocked: true
   property bool gpuControl: false
   property bool aioFanControl: false
+  property bool cpuControl: false
+  property bool cpuFanPresent: false
+  property var sensors: ({ pump: "cpu", aio: "liquid", cpu: "cpu" })
+  property var liquidCurves: ({})
   property string pumpSensor: "cpu"
+  property string notice: ""
   property bool locked: true
   property var curves: ({})
   property string selectedChannel: "chassis"
@@ -83,7 +88,12 @@ Item {
     presetsLocked = msg.presetsLocked !== false
     gpuControl = msg.gpuControl === true
     aioFanControl = msg.aioFanControl === true
+    if ("cpuControl" in msg) cpuControl = msg.cpuControl === true
+    if ("cpuFanPresent" in msg) cpuFanPresent = msg.cpuFanPresent === true
+    if (msg.sensors) sensors = msg.sensors
+    if (msg.liquidCurves) liquidCurves = msg.liquidCurves
     if (msg.pumpSensor === "liquid" || msg.pumpSensor === "cpu") pumpSensor = msg.pumpSensor
+    if ("notice" in msg) notice = String(msg.notice || "")
     locked = msg.locked === true
     curves = msg.curves || curves
     selectedChannel = String(msg.selectedChannel || selectedChannel)
@@ -109,7 +119,11 @@ Item {
   function setPresetsLocked(lockedFlag) { send({ op: "set_presets_locked", locked: lockedFlag === true }) }
   function setGpuControl(on) { send({ op: "set_gpu_control", enabled: on === true }) }
   function setAioFanControl(on) { send({ op: "set_aio_fan_control", enabled: on === true }) }
-  function setPumpSensor(id) { send({ op: "set_pump_sensor", sensor: String(id) }) }
+  function setCpuControl(on) { send({ op: "set_cpu_control", enabled: on === true }) }
+  function setPumpSensor(id) { send({ op: "set_pump_sensor", channel: "pump", sensor: String(id) }) }
+  function setChannelSensor(channel, id) { send({ op: "set_pump_sensor", channel: String(channel), sensor: String(id) }) }
+  function exportSettings(path) { send({ op: "export_settings", path: String(path) }) }
+  function importSettings(path) { send({ op: "import_settings", path: String(path) }) }
   function setChannel(id) { send({ op: "set_channel", channel: String(id) }) }
   function setPoint(index, value, curveMode) {
     send({ op: "set_point", mode: String(curveMode || mode), channel: selectedChannel, index: index, value: value })
@@ -145,6 +159,10 @@ Item {
     if (hasSetting("aioFanControl")) {
       var aio = settings.aioFanControl === true
       if (aio !== aioFanControl) setAioFanControl(aio)
+    }
+    if (hasSetting("cpuControl")) {
+      var cpuFan = settings.cpuControl === true
+      if (cpuFan !== cpuControl) setCpuControl(cpuFan)
     }
   }
 
