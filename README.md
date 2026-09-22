@@ -21,11 +21,9 @@ OmaFlow needs these to *apply* curves. Telemetry (CPU/GPU/coolant temps, RPM) wo
 | `nvidia-settings` | GPU fans, only after you enable GPU on Settings |
 | Python 3 | Already on Omarchy. Pillow is used to draw a tinted liquid-temp LCD |
 
-Open the widget the first time and press **Install dependencies**. That runs `setup` in a floating terminal (sudo once): liquidctl from the Omarchy package set, a polkit helper, and the fan2go systemd unit.
+Open the widget the first time and press **Install dependencies**. One password installs `liquidctl` and `omaflow-system` from the Omarchy repositories. `omaflow-system` is the helper, the polkit rule, and the fan2go unit. The plugin script does not run its own program as root.
 
-Install **fan2go yourself** so `/usr/bin/fan2go` is the packaged binary. Setup does not download it and does not build it from the AUR. Chassis PWM still works through the helper if the package is not installed yet; run setup again after installing fan2go to enable the service.
-
-If the cooler uses motherboard headers instead of USB (a one-cable Arctic-style AIO, or no AIO at all), press **Install fan control only**. That installs the helper and skips liquidctl.
+Install **fan2go yourself** so `/usr/bin/fan2go` is the packaged binary. Setup does not download it. Chassis headers stay on the BIOS curve until that binary is installed and you run setup again so the unit can start.
 
 `omarchy plugin add` never runs package managers or sudo. The setup script is the only step that asks for a password.
 
@@ -128,7 +126,7 @@ omarchy bar move tempest-chaoscreator.omaflow --section right
 omarchy plugin remove tempest-chaoscreator.omaflow
 ```
 
-That deletes the plugin folder and its bar entry. liquidctl and fan2go stay installed; drop liquidctl with `omarchy pkg drop liquidctl`, and remove fan2go with the same package manager you used to install it. The helper lives at `/usr/local/lib/omaflow/omaflow-helper`, the unit at `/etc/systemd/system/fan2go.service`, the config at `/etc/fan2go/fan2go.yaml`, and the database at `/var/lib/omaflow/fan2go.db`.
+That deletes the plugin folder and its bar entry. liquidctl and fan2go stay installed; drop liquidctl with `omarchy pkg drop liquidctl`, and remove fan2go with the same package manager you used to install it. The helper is the `omaflow-system` package: `/usr/lib/omaflow/omaflow-helper`. The unit is `/etc/systemd/system/fan2go.service`, the config is `/etc/fan2go/fan2go.yaml`, and the database is `/var/lib/omaflow/fan2go.db`. Remove the package with `omarchy pkg drop omaflow-system`.
 
 ## Using it
 

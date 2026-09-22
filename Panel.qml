@@ -141,7 +141,6 @@ Panel {
   readonly property string tooltip: "OmaFlow · " + Model.modeLabel(mode) + " · " + Model.formatTemp(hottest)
   readonly property string setupPath: Qt.resolvedUrl("setup").toString().replace(/^file:\/\//, "")
   readonly property string headerAioHint: "One-cable AIOs (Arctic and similar) use a single CPU_FAN lead.\nTurn the CPU toggle off and let the BIOS run that header,\nor split the cable: pump to AIO_PUMP, radiator fans to CPU_FAN."
-  readonly property string fansOnlyHint: "Fans only skips liquidctl.\nUse it when the cooler has no USB connection."
 
   function persistSettings(values) {
     var entry = { id: root.moduleName }
@@ -162,16 +161,8 @@ Panel {
   Component.onCompleted: pushSettings()
 
   function installStack() {
-    runSetup("")
-  }
-
-  function installFansOnly() {
-    runSetup(" --fans-only")
-  }
-
-  function runSetup(extra) {
     if (bar && typeof bar.run === "function")
-      bar.run("omarchy-launch-floating-terminal-with-presentation \"bash '" + setupPath + "'" + extra + "\"")
+      bar.run("omarchy-launch-floating-terminal-with-presentation \"bash '" + setupPath + "'\"")
   }
 
   function fileUrl(value) {
@@ -561,7 +552,7 @@ Panel {
             Text {
               width: parent.width
               wrapMode: Text.WordWrap
-              text: "OmaFlow talks to fan2go for chassis fans and to liquidctl for the AIO pump and LCD. GPU fans and AIO radiator fans stay on their own control until you unlock them. Run setup once so the helper can apply curves (sudo in a terminal)."
+              text: "One password installs liquidctl and the OmaFlow system package. That package is the signed helper and fan unit. fan2go itself is a separate package you install first if you want chassis headers driven. Until then those headers stay on the BIOS curve."
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.body
@@ -573,39 +564,28 @@ Panel {
               bordered: true
               foreground: root.fg
               fontFamily: root.fontFamily
-              tooltipText: "Opens a terminal and runs setup. Installs liquidctl and the helper. fan2go must already be installed."
+              tooltipText: "Opens a terminal and installs liquidctl and omaflow-system. One password."
               onClicked: root.installStack()
             }
 
-            Text {
-              width: parent.width
-              wrapMode: Text.WordWrap
-              text: "A cooler that plugs into motherboard headers instead of USB does not need liquidctl."
-              color: root.dim
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-            }
-
             Row {
+              width: parent.width
               spacing: Style.space(6)
 
-              Button {
-                text: "Install fan control only"
-                bordered: true
-                foreground: root.fg
-                fontFamily: root.fontFamily
-                fontSize: Style.font.caption
-                horizontalPadding: Style.space(10)
-                verticalPadding: Style.space(6)
-                tooltipText: "Installs the helper and skips liquidctl. fan2go must already be installed."
-                onClicked: root.installFansOnly()
+              Text {
+                width: parent.width - Style.space(40)
+                wrapMode: Text.WordWrap
+                text: "A one-cable AIO on CPU_FAN should leave the CPU switch off and let the BIOS run that header."
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
               }
 
               PanelActionButton {
                 anchors.verticalCenter: parent.verticalCenter
                 iconText: "\u{f05a}"
                 foreground: root.fg
-                tooltipText: root.headerAioHint + "\n\n" + root.fansOnlyHint
+                tooltipText: root.headerAioHint
               }
             }
           }

@@ -52,7 +52,7 @@ FAN2GO_BIN = Path("/usr/bin/fan2go")
 LCD_PNG = CONFIG_DIR / "lcd-accent.png"
 THEME_COLORS = Path.home() / ".local/state/omarchy/current/theme/colors.toml"
 LCD_SIZE = 320
-HELPER_INSTALLED = Path("/usr/local/lib/omaflow/omaflow-helper")
+HELPER_INSTALLED = Path("/usr/lib/omaflow/omaflow-helper")
 
 # Skip these hwmon names as chassis PWM targets (AIO / sensors / unused).
 AIO_HWMON = {"z53", "z63", "z73", "nzxtkraken3", "kraken3", "liquidctl"}
