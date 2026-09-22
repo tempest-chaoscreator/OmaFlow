@@ -2,11 +2,9 @@
 
 Fan, pump, and AIO control from the [Omarchy](https://omarchy.org/) bar. Chassis fans through [fan2go](https://github.com/markusressel/fan2go), NVIDIA GPU fans through `nvidia-settings` (off until you enable them), AIO pump / radiator / LCD through [liquidctl](https://github.com/liquidctl/liquidctl). Same modes on both tabs, no separate panel for the pump.
 
-![OmaFlow telemetry](screenshots/telemetry.png)
+![OmaFlow settings](screenshots/settings.jpg)
 
-![OmaFlow curves](screenshots/curves.png)
-
-![OmaFlow GPU and LCD](screenshots/curves-lcd.png)
+![OmaFlow telemetry](screenshots/telemetry.jpg)
 
 ## Compatible version
 
@@ -151,7 +149,9 @@ Pump, AIO, and CPU each have a curve input: CPU temp or liquid temp. GPU and AIO
 
 The bottom of Settings exports and imports a JSON file of the stored curves and settings.
 
-GPU, AIO, and the CPU header stay unmanaged until you enable their switches.
+Every channel card has a switch. Off does not stop the fan. A motherboard header (chassis, `CPU_FAN`, `AIO_PUMP`) is handed back to the BIOS curve. NVIDIA fans go back to the driver's own curve. A USB cooler has no BIOS curve, so OmaFlow simply stops sending new speeds and the device keeps the last duty — never 0%. Silent's AIO curve sits 10–15 points above the chassis curve. The AIO card opens on CPU temperature. If fan2go sees an `AIO_PUMP` header and there is no USB cooler, that header follows the Pump curve. A USB pump and that header are never driven together.
+
+GPU and AIO stay off until you enable them. Chassis and Pump start on. The CPU switch is shown on its card and stays locked off when no `CPU_FAN` header is detected.
 
 | Mode | Fans | Pump |
 | --- | --- | --- |

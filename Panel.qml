@@ -23,7 +23,11 @@ Panel {
   readonly property bool gpuControl: service ? service.gpuControl === true : false
   readonly property bool aioFanControl: service ? service.aioFanControl === true : false
   readonly property bool cpuControl: service ? service.cpuControl === true : false
+  readonly property bool chassisControl: service ? service.chassisControl !== false : true
+  readonly property bool pumpControl: service ? service.pumpControl !== false : true
   readonly property bool cpuFanPresent: service ? service.cpuFanPresent === true : false
+  readonly property bool pumpHeader: service ? service.pumpHeader === true : false
+  readonly property bool usbPump: service ? service.usbPump === true : false
   readonly property var sensors: service && service.sensors ? service.sensors : ({})
   readonly property var liquidCurves: service && service.liquidCurves ? service.liquidCurves : ({})
   readonly property string pumpSensor: service && service.pumpSensor === "liquid" ? "liquid" : "cpu"
@@ -68,7 +72,7 @@ Panel {
     { value: "hell", label: "Hell" }
   ]
   readonly property var channelOptions: {
-    var _flags = (root.gpuControl ? 1 : 0) + (root.aioFanControl ? 2 : 0) + (root.cpuControl ? 4 : 0) + (root.cpuFanPresent ? 8 : 0)
+    var _flags = (root.gpuControl ? 1 : 0) + (root.aioFanControl ? 2 : 0) + (root.cpuControl ? 4 : 0) + (root.cpuFanPresent ? 8 : 0) + (root.chassisControl ? 16 : 0) + (root.pumpControl ? 32 : 0)
     var all = [
       { value: "chassis", label: "Chassis", flags: _flags },
       { value: "pump", label: "Pump" },
@@ -95,7 +99,7 @@ Panel {
     var stored = sensors ? sensors[id] : ""
     if (stored === "liquid" || stored === "cpu") return stored
     if (id === "pump") return pumpSensor
-    if (id === "aio") return "liquid"
+    if (id === "aio") return "cpu"
     return "cpu"
   }
 
@@ -222,28 +226,58 @@ Panel {
     persistSettings({ cpuControl: on })
   }
 
+  function toggleChassisControl() {
+    if (!service) return
+    var on = !root.chassisControl
+    service.setChassisControl(on)
+    persistSettings({ chassisControl: on })
+  }
+
+  function togglePumpControl() {
+    if (!service) return
+    var on = !root.pumpControl
+    service.setPumpControl(on)
+    persistSettings({ pumpControl: on })
+  }
+
   function toggleChannel(id) {
+    if (!root.channelToggleEnabled(id)) return
     if (id === "gpu") root.toggleGpuControl()
     else if (id === "aio") root.toggleAioFanControl()
     else if (id === "cpu") root.toggleCpuControl()
+    else if (id === "chassis") root.toggleChassisControl()
+    else if (id === "pump") root.togglePumpControl()
+  }
+
+  function channelToggleEnabled(id) {
+    return id !== "cpu" || root.cpuFanPresent
   }
 
   function channelIsLive(id) {
-    return Model.channelEnabled(id, root.gpuControl, root.aioFanControl, root.cpuControl, root.cpuFanPresent)
+    return Model.channelEnabled(id, root.gpuControl, root.aioFanControl, root.cpuControl, root.cpuFanPresent, root.chassisControl, root.pumpControl)
   }
 
   function channelTip(id) {
-    if (id === "gpu" && !root.gpuControl) return "GPU fans stay on NVIDIA's curve until you turn this on"
-    if (id === "aio" && !root.aioFanControl) return "AIO radiator fans stay unmanaged until you turn this on"
-    if (id === "cpu" && !root.cpuFanPresent) return "No CPU fan header detected"
-    if (id === "cpu" && !root.cpuControl) return "CPU fan stays on the BIOS curve until you turn this on"
+    if (id === "cpu" && !root.cpuFanPresent) return "No CPU fan header detected. The switch stays off."
+    if (id === "gpu" && !root.gpuControl) return "Off returns the fans to NVIDIA's own curve"
+    if (id === "aio" && !root.aioFanControl) return "Off stops new radiator commands. The cooler keeps its last speed."
+    if (id === "chassis" && !root.chassisControl) return "Off returns these headers to the BIOS curve"
+    if (id === "pump" && !root.pumpControl)
+      return root.usbPump
+        ? "Off stops new pump commands. A USB pump keeps its last speed, never 0%."
+        : "Off returns an AIO_PUMP header to the BIOS curve"
+    if (id === "cpu" && !root.cpuControl) return "Off returns CPU_FAN to the BIOS curve"
     return Model.channelLabel(id)
   }
 
   function channelOverlay() {
-    if (root.selectedChannel === "gpu") return "controlled by the GPU"
+    if (root.selectedChannel === "gpu") return "on NVIDIA's curve"
     if (root.selectedChannel === "cpu")
-      return root.cpuFanPresent ? "controlled by the BIOS" : "no CPU fan detected"
+      return root.cpuFanPresent ? "left to the BIOS" : "no CPU fan detected"
+    if (root.selectedChannel === "chassis") return "left to the BIOS"
+    if (root.selectedChannel === "pump")
+      return root.usbPump ? "USB pump holds its last speed" : "left to the BIOS"
+    if (root.selectedChannel === "aio") return "cooler holds its last fan speed"
     return "not active"
   }
 
@@ -752,9 +786,8 @@ Panel {
                   BorderSurface {
                     id: chip
                     required property var modelData
-                    readonly property bool togglable: modelData.value === "gpu" || modelData.value === "aio" || modelData.value === "cpu"
-                    readonly property bool canToggle: modelData.value !== "cpu" || root.cpuFanPresent
-                    readonly property bool expanded: togglable && canToggle && root.selectedChannel === modelData.value
+                    readonly property bool switchEnabled: root.channelToggleEnabled(modelData.value)
+                    readonly property bool expanded: root.selectedChannel === modelData.value
                     readonly property int padX: Style.space(10)
                     readonly property int padY: Style.space(6)
                     property real targetWidth: expanded
@@ -783,18 +816,18 @@ Panel {
                       font.bold: true
                     }
 
-                    ToggleSwitch {
+                    SquareSwitch {
                       id: chipSwitch
                       anchors.left: chipLabel.right
                       anchors.leftMargin: Style.space(8)
                       anchors.verticalCenter: parent.verticalCenter
                       visible: chip.expanded
-                      opacity: chip.expanded ? 1 : 0
-                      checked: root.channelIsLive(modelData.value)
-                      trackHeight: Math.max(14, Style.space(16))
+                      opacity: chip.expanded ? (chip.switchEnabled ? 1 : 0.4) : 0
+                      on: root.channelIsLive(modelData.value) && chip.switchEnabled
+                      switchEnabled: chip.switchEnabled
                       foreground: root.fg
                       accent: root.accent
-                      onToggled: root.toggleChannel(modelData.value)
+                      onClicked: root.toggleChannel(modelData.value)
                       Behavior on opacity { NumberAnimation { duration: 140 } }
                     }
 
@@ -892,7 +925,7 @@ Panel {
 
                 Button {
                   anchors.horizontalCenter: parent.horizontalCenter
-                  visible: root.selectedChannel === "gpu" || root.selectedChannel === "aio" || (root.selectedChannel === "cpu" && root.cpuFanPresent)
+                  visible: root.channelToggleEnabled(root.selectedChannel)
                   text: "Enable"
                   bordered: true
                   foreground: root.fg
@@ -964,15 +997,65 @@ Panel {
               }
             }
 
-            Toggle {
+            BorderSurface {
+              id: themeSyncRow
               width: parent.width
-              label: "Sync with theme accent"
-              description: "Tint the LCD (including Liquid temp) and AIO LEDs with the Omarchy accent. Stock Liquid temp is firmware-white; with sync on, OmaFlow redraws it in the theme color."
-              checked: root.themeSync
-              foreground: root.fg
-              accent: root.accent
-              fontFamily: root.fontFamily
-              onClicked: root.setThemeSync(!root.themeSync)
+              implicitHeight: Math.max(Style.space(54), themeSyncText.implicitHeight + Style.spacing.huge)
+              radius: Style.cornerRadius
+              color: Style.controlFill(false, themeSyncMouse.containsMouse, root.fg, root.accent)
+              borderSpec: Border.controlSpec(themeSyncMouse.containsMouse ? "hover-cursor" : "normal", root.fg, root.accent)
+
+              Row {
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                anchors.leftMargin: themeSyncRow.borderLeft + Style.spacing.rowPaddingX
+                anchors.rightMargin: themeSyncRow.borderRight + Style.spacing.rowPaddingX
+                spacing: Style.spacing.rowPaddingX
+
+                Column {
+                  id: themeSyncText
+                  width: parent.width - themeSyncSwitch.implicitWidth - parent.spacing
+                  spacing: Style.spacing.xs
+                  anchors.verticalCenter: parent.verticalCenter
+
+                  Text {
+                    width: parent.width
+                    text: "Sync with theme accent"
+                    color: root.fg
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.subtitle
+                    font.bold: true
+                    elide: Text.ElideRight
+                  }
+
+                  Text {
+                    width: parent.width
+                    wrapMode: Text.WordWrap
+                    text: "Tint the LCD (including Liquid temp) and AIO LEDs with the Omarchy accent. Stock Liquid temp is firmware-white; with sync on, OmaFlow redraws it in the theme color."
+                    color: Qt.darker(root.fg, 1.5)
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+                }
+
+                SquareSwitch {
+                  id: themeSyncSwitch
+                  anchors.verticalCenter: parent.verticalCenter
+                  on: root.themeSync
+                  interactive: false
+                  foreground: root.fg
+                  accent: root.accent
+                }
+              }
+
+              MouseArea {
+                id: themeSyncMouse
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.setThemeSync(!root.themeSync)
+              }
             }
 
             Row {

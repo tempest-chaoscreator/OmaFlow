@@ -178,10 +178,12 @@ function isLocked(locks, mode) {
   return locks[String(mode)] !== false
 }
 
-function channelEnabled(id, gpuControl, aioFanControl, cpuControl, cpuPresent) {
+function channelEnabled(id, gpuControl, aioFanControl, cpuControl, cpuPresent, chassisControl, pumpControl) {
   if (id === "gpu") return gpuControl === true
   if (id === "aio") return aioFanControl === true
   if (id === "cpu") return cpuControl === true && cpuPresent === true
+  if (id === "chassis") return chassisControl !== false
+  if (id === "pump") return pumpControl !== false
   return true
 }
 

@@ -136,31 +136,59 @@ def atomic_write(directory: str, name: str, data: bytes, mode: int, dir_mode: in
         os.close(dirfd)
 
 
-def hwmon_by_name(name: str) -> str:
+def sysfs_target_parts(link: str) -> list[str] | None:
+    """Accept the one kernel symlink in /sys/class/hwmon.
+
+    Class entries point at a real directory under /sys/devices. Anything
+    else, including a link that normalizes out of /sys/devices, is refused.
+    The returned parts are opened with O_NOFOLLOW, so later components
+    cannot be swapped for a symlink.
+    """
+    if link.startswith("/"):
+        raw = os.path.normpath(link)
+    else:
+        raw = os.path.normpath("/sys/class/hwmon/" + link)
+    if not raw.startswith("/sys/devices/"):
+        return None
+    parts = [part for part in raw.split("/") if part]
+    if not parts or any(part in (".", "..") for part in parts):
+        return None
+    return parts
+
+
+def hwmon_device_parts(name: str) -> list[str]:
     if not NAME_RE.match(name):
         die(f"refusing hwmon name {name!r}")
     root = walk_open(["sys", "class", "hwmon"], os.O_RDONLY | os.O_DIRECTORY)
     try:
         matches = []
         for entry in os.listdir(root):
-            if not entry.startswith("hwmon"):
+            if not re.fullmatch(r"hwmon[0-9]+", entry):
                 continue
             try:
-                dev = os.open(entry, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=root)
+                link = os.readlink(entry, dir_fd=root)
+            except OSError:
+                continue
+            parts = sysfs_target_parts(link)
+            if parts is None:
+                continue
+            try:
+                dev = walk_open(parts, os.O_RDONLY | os.O_DIRECTORY)
             except OSError:
                 continue
             try:
-                nfd = os.open("name", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dev)
-            except OSError:
-                os.close(dev)
-                continue
-            try:
-                raw = os.read(nfd, 128).decode("utf-8", "replace").strip()
+                try:
+                    nfd = os.open("name", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dev)
+                except OSError:
+                    continue
+                try:
+                    raw = os.read(nfd, 128).decode("utf-8", "replace").strip()
+                finally:
+                    os.close(nfd)
+                if raw == name:
+                    matches.append(parts)
             finally:
-                os.close(nfd)
-            if raw == name:
-                matches.append(entry)
-            os.close(dev)
+                os.close(dev)
         if len(matches) != 1:
             die(f"refusing hwmon name {name!r}: found {len(matches)}")
         return matches[0]
@@ -168,12 +196,12 @@ def hwmon_by_name(name: str) -> str:
         os.close(root)
 
 
-def sysfs_write(hwmon_entry: str, leaf: str, text: str) -> None:
-    if not re.fullmatch(r"hwmon[0-9]+", hwmon_entry):
-        die("bad hwmon entry")
+def sysfs_write(device_parts: list[str], leaf: str, text: str) -> None:
+    if not device_parts or device_parts[0] != "sys":
+        die("bad hwmon device")
     if not re.fullmatch(r"pwm[1-9][0-9]?(_enable)?", leaf):
         die("bad pwm leaf")
-    root = walk_open(["sys", "class", "hwmon", hwmon_entry], os.O_RDONLY | os.O_DIRECTORY)
+    root = walk_open(device_parts, os.O_RDONLY | os.O_DIRECTORY)
     try:
         fd = os.open(leaf, os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=root)
     except OSError as exc:
@@ -195,12 +223,12 @@ def write_pwm(name: str, channel: str, value: str) -> None:
         die(f"bad pwm value {value!r}")
     if pwm < 0 or pwm > 255:
         die(f"bad pwm value {value!r}")
-    entry = hwmon_by_name(name)
+    device = hwmon_device_parts(name)
     enable = f"pwm{channel}_enable"
     target = f"pwm{channel}"
     # Manual mode when the enable file exists. A missing enable file still
     # allows a direct pwm write on controllers that do not expose it.
-    root = walk_open(["sys", "class", "hwmon", entry], os.O_RDONLY | os.O_DIRECTORY)
+    root = walk_open(device, os.O_RDONLY | os.O_DIRECTORY)
     try:
         has_enable = True
         try:
@@ -211,8 +239,8 @@ def write_pwm(name: str, channel: str, value: str) -> None:
     finally:
         os.close(root)
     if has_enable:
-        sysfs_write(entry, enable, "1")
-    sysfs_write(entry, target, str(pwm))
+        sysfs_write(device, enable, "1")
+    sysfs_write(device, target, str(pwm))
     print(f"ok {name} pwm{channel}={pwm}")
 
 
@@ -220,8 +248,8 @@ def release_pwm(name: str, channel: str) -> None:
     """Return a header to the firmware curve so the BIOS can drive it."""
     if not re.fullmatch(r"[1-9][0-9]?", channel):
         die(f"bad pwm channel {channel!r}")
-    entry = hwmon_by_name(name)
-    sysfs_write(entry, f"pwm{channel}_enable", "2")
+    device = hwmon_device_parts(name)
+    sysfs_write(device, f"pwm{channel}_enable", "2")
     print(f"ok {name} pwm{channel}_enable=2")
 
 
@@ -615,14 +643,56 @@ def unit_text_is_safe(text: str) -> bool:
     return True
 
 
-def restart_fan2go() -> None:
-    if not os.path.isfile("/usr/bin/systemctl"):
-        die("systemctl not found")
-    show = subprocess.run(
+def read_root_unit() -> str:
+    try:
+        fd = walk_open(["etc", "systemd", "system", "fan2go.service"], os.O_RDONLY)
+    except OSError:
+        return ""
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o022 or st.st_size > 65536:
+            return ""
+        return os.read(fd, st.st_size).decode("utf-8", "replace")
+    finally:
+        os.close(fd)
+
+
+def disk_unit_is_safe(text: str) -> bool:
+    if "ExecStart=/usr/bin/fan2go -c /etc/fan2go/fan2go.yaml" not in text:
+        return False
+    for banned in (".config/omaflow", "/tmp/", "fan2go-omaflow.db", "/home/"):
+        if banned in text:
+            return False
+    return True
+
+
+def systemctl_show_unit() -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
         ["systemctl", "show", FAN2GO_UNIT, "-p", "FragmentPath", "-p", "ExecStart"],
         capture_output=True,
         text=True,
     )
+
+
+def restart_fan2go() -> None:
+    if not os.path.isfile("/usr/bin/systemctl"):
+        die("systemctl not found")
+    # The on-disk unit is the reviewed root-config file. systemd may still
+    # have the previous unit loaded, whose ExecStart points at a home path.
+    # Reload only after the file itself has been checked.
+    disk = read_root_unit()
+    if not disk_unit_is_safe(disk):
+        die("refusing to restart fan2go: on-disk unit is not the root-config service")
+    show = systemctl_show_unit()
+    if show.returncode != 0 or not unit_text_is_safe(show.stdout):
+        reloaded = subprocess.run(
+            ["systemctl", "daemon-reload"],
+            capture_output=True,
+            text=True,
+        )
+        if reloaded.returncode != 0:
+            die(reloaded.stderr.strip() or "could not reload systemd units")
+        show = systemctl_show_unit()
     if show.returncode != 0 or not unit_text_is_safe(show.stdout):
         die("refusing to restart fan2go: unit is not the root-config service")
     restart = subprocess.run(
@@ -653,6 +723,12 @@ def check_fan2go() -> None:
 
 
 def self_test() -> None:
+    allowed = sysfs_target_parts("../../devices/platform/asus-ec-sensors/hwmon/hwmon3")
+    if allowed != ["sys", "devices", "platform", "asus-ec-sensors", "hwmon", "hwmon3"]:
+        die(f"self-test: hwmon link rejected: {allowed}")
+    for blocked in ("/etc/passwd", "../../../../tmp/x", "/sys/devices/../../../etc/passwd", "hwmon3"):
+        if sysfs_target_parts(blocked) is not None:
+            die(f"self-test: unsafe hwmon link accepted: {blocked}")
     fixture = """\
 # comment
 dbPath: /home/someone/.local/share/omaflow/fan2go.db
@@ -756,6 +832,15 @@ fans: []
     )
     if not unit_text_is_safe(safe):
         die("self-test: safe unit rejected")
+    safe_disk = (
+        "[Service]\n"
+        "ExecStart=/usr/bin/fan2go -c /etc/fan2go/fan2go.yaml\n"
+        "ProtectHome=yes\n"
+    )
+    if not disk_unit_is_safe(safe_disk):
+        die("self-test: safe on-disk unit rejected")
+    if disk_unit_is_safe(safe_disk.replace("/etc/fan2go/fan2go.yaml", "/home/user/.config/omaflow/fan2go.yaml")):
+        die("self-test: home-config unit accepted")
     if unit_text_is_safe(safe.replace("/etc/fan2go/fan2go.yaml", "/home/user/.config/omaflow/fan2go.yaml")):
         die("self-test: user-config unit accepted")
     if unit_text_is_safe(safe + "db=/tmp/fan2go-omaflow.db\n"):
