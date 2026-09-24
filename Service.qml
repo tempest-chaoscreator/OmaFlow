@@ -39,6 +39,8 @@ Item {
   property var aio: ({})
   property var fans: []
   property var history: ({ cpu: [], gpu: [], coolant: [] })
+  property int traceInterval: 0
+  property real traceUntil: 0
   property var fan2go: ({ installed: false, running: false })
   property var liquidctl: ({ installed: false, hasAio: false, name: "" })
   property string lcdMode: "liquid"
@@ -80,6 +82,14 @@ Item {
       if (accentHex !== "") send({ op: "set_accent", hex: accentHex })
       return
     }
+    if (msg.event === "trace") {
+      if (msg.history) history = msg.history
+      if (msg.trace) {
+        traceInterval = Number(msg.trace.interval) || 0
+        traceUntil = Number(msg.trace.until) || 0
+      }
+      return
+    }
     if (msg.event === "state") applyState(msg)
   }
 
@@ -110,6 +120,10 @@ Item {
     aio = msg.aio || ({})
     fans = Array.isArray(msg.fans) ? msg.fans : []
     history = msg.history || history
+    if (msg.trace) {
+      traceInterval = Number(msg.trace.interval) || 0
+      traceUntil = Number(msg.trace.until) || 0
+    }
     fan2go = msg.fan2go || fan2go
     liquidctl = msg.liquidctl || liquidctl
     lcdMode = String(msg.lcdMode || lcdMode)
@@ -144,6 +158,7 @@ Item {
   function setLcdBrightness(v) { send({ op: "set_lcd", mode: lcdMode, brightness: Math.round(v) }) }
   function setThemeSync(on) { send({ op: "set_theme_sync", enabled: on === true }) }
   function refresh() { send({ op: "refresh" }) }
+  function setTrace(seconds) { send({ op: "set_trace", interval: Number(seconds) || 0 }) }
 
   function hasSetting(name) {
     return !!(settings && settings[name] !== undefined && settings[name] !== null)

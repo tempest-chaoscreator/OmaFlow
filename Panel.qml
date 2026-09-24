@@ -41,6 +41,18 @@ Panel {
   readonly property var aio: service && service.aio ? service.aio : ({})
   readonly property var fans: service && service.fans ? service.fans : []
   readonly property var history: service && service.history ? service.history : ({})
+  readonly property int traceInterval: service ? Number(service.traceInterval) || 0 : 0
+  readonly property real traceUntil: service ? Number(service.traceUntil) || 0 : 0
+  property int traceTick: 0
+  readonly property string traceRemain: {
+    var tick = traceTick
+    if (traceInterval <= 0 || traceUntil <= 0) return ""
+    var left = Math.max(0, Math.ceil(traceUntil - Date.now() / 1000))
+    void tick
+    var mins = Math.floor(left / 60)
+    var secs = left % 60
+    return mins + ":" + (secs < 10 ? "0" : "") + secs
+  }
   readonly property var fan2go: service && service.fan2go ? service.fan2go : ({})
   readonly property var liquidctl: service && service.liquidctl ? service.liquidctl : ({})
   readonly property string lcdMode: service ? String(service.lcdMode) : "liquid"
@@ -315,6 +327,13 @@ Panel {
 
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
+
+  Timer {
+    interval: 1000
+    repeat: true
+    running: root.traceInterval > 0 && root.opened
+    onTriggered: root.traceTick = root.traceTick + 1
+  }
 
   WidgetButton {
     id: button
@@ -718,14 +737,68 @@ Panel {
             }
 
             PanelSectionHeader {
-              text: "Last minute"
+              text: "Live graph"
               foreground: root.fg
               fontFamily: root.fontFamily
+            }
+
+            Row {
+              spacing: Style.space(6)
+
+              Repeater {
+                model: [3, 5, 10, 30]
+                BorderSurface {
+                  id: traceChip
+                  required property int modelData
+                  readonly property bool selected: root.traceInterval === modelData
+                  width: traceLabel.implicitWidth + Style.space(20)
+                  implicitHeight: traceLabel.implicitHeight + Style.space(12)
+                  height: implicitHeight
+                  radius: Style.cornerRadius
+                  color: selected
+                    ? Style.selectedFillFor(root.fg, root.accent)
+                    : (traceMouse.containsMouse ? Style.hoverFillFor(root.fg, root.accent) : "transparent")
+                  borderSpec: Border.controlSpec("normal", root.fg, root.accent)
+
+                  Text {
+                    id: traceLabel
+                    anchors.centerIn: parent
+                    text: modelData + "s"
+                    color: root.fg
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    font.bold: true
+                  }
+
+                  MouseArea {
+                    id: traceMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: {
+                      if (!root.service) return
+                      root.service.setTrace(traceChip.selected ? 0 : modelData)
+                    }
+                  }
+                }
+              }
+            }
+
+            Text {
+              width: parent.width
+              wrapMode: Text.WordWrap
+              text: root.traceInterval > 0
+                ? ("CPU every " + root.traceInterval + "s · " + root.traceRemain + " left, then it stops")
+                : "Off. Pick an interval to sample CPU temp for 5 minutes."
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
             }
 
             Sparkline {
               width: parent.width
               height: Style.space(72)
+              visible: root.traceInterval > 0
               values: root.history.cpu || []
               stroke: root.accent
               foreground: root.fg

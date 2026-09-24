@@ -2,7 +2,7 @@ dbPath: /var/lib/omaflow/fan2go.db
 runFanInitializationInParallel: false
 tempRollingWindowSize: 12
 fanController:
-  adjustmentTickRate: 1s
+  adjustmentTickRate: 5s
 api:
   enabled: true
   host: 127.0.0.1

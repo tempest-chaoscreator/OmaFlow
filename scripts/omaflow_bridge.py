@@ -40,8 +40,17 @@ SENSOR_CHANNELS = ("pump", "aio", "cpu")
 MODES = ("silent", "static", "performance", "hell", "custom")
 CPU_FAN_RE = re.compile(r"cpu[_\s-]?fan|(^|[^a-z])cpu([^a-z]|$)", re.I)
 CPU_FAN_SKIP_RE = re.compile(r"opt|pump|water|flow|aio|gpu|chassis", re.I)
-HISTORY_LEN = 60
-POLL_S = 1.0
+# Five minutes at the fastest graph interval (3s) is 100 points.
+HISTORY_LEN = 100
+# Bar readout and fan decisions stay on this cadence even while a
+# faster graph is recording.
+POLL_S = 5.0
+TRACE_WINDOW_S = 300
+TRACE_INTERVALS = (3, 5, 10, 30)
+# ~3% duty. Smaller steps are sensor noise, not a new fan command.
+PWM_HYSTERESIS = 8
+PWM_RETRY_S = 30
+PWM_MIN_GAP_S = 5
 APPLY_DEBOUNCE_S = 0.8
 FAN2GO_API = "http://127.0.0.1:9001"
 CONFIG_DIR = Path.home() / ".config" / "omaflow"
@@ -52,7 +61,11 @@ FAN2GO_BIN = Path("/usr/bin/fan2go")
 LCD_PNG = CONFIG_DIR / "lcd-accent.png"
 THEME_COLORS = Path.home() / ".local/state/omarchy/current/theme/colors.toml"
 LCD_SIZE = 320
-HELPER_INSTALLED = Path("/usr/lib/omaflow/omaflow-helper")
+# Packaged unit first, then the older published path still on some machines.
+HELPER_CANDIDATES = (
+    Path("/usr/lib/omaflow/omaflow-helper"),
+    Path("/usr/local/lib/omaflow/omaflow-helper"),
+)
 
 # Skip these hwmon names as chassis PWM targets (AIO / sensors / unused).
 AIO_HWMON = {"z53", "z63", "z73", "nzxtkraken3", "kraken3", "liquidctl"}
@@ -77,6 +90,32 @@ def clamp(v, lo, hi):
     except (TypeError, ValueError):
         n = lo
     return max(lo, min(hi, n))
+
+
+def whole_degree(value):
+    """Drop tenths. A 0.1°C wobble was retriggering the cooler and the fan math."""
+    if value is None:
+        return None
+    try:
+        return int(round(float(value)))
+    except (TypeError, ValueError):
+        return None
+
+
+def pwm_should_write(target, last, current, attempted, since_attempt,
+                     hyst=PWM_HYSTERESIS, retry_s=PWM_RETRY_S, min_gap=PWM_MIN_GAP_S):
+    """True only when the header is actually away from the target and we
+    have not just asked for this same value."""
+    if current is not None and abs(target - int(current)) < hyst:
+        return False
+    if last is not None and abs(target - int(last)) < hyst:
+        return False
+    if since_attempt is not None and since_attempt < min_gap:
+        return False
+    if (attempted is not None and since_attempt is not None
+            and abs(target - int(attempted)) < hyst and since_attempt < retry_s):
+        return False
+    return True
 
 
 _which_cache = {}
@@ -621,7 +660,7 @@ def render_liquid_png(path: Path, temp, accent: str, background: str, size: int 
     if temp is None or not isinstance(temp, (int, float)):
         number = "—"
     else:
-        number = f"{float(temp):.1f}"
+        number = str(whole_degree(temp))
     font = _lcd_font(92)
     label_font = _lcd_font(26)
     nb = draw.textbbox((0, 0), number, font=font)
@@ -846,7 +885,7 @@ def build_fan2go_yaml(state, chips, has_nvidia: bool = False, usb_pump: bool = F
         "runFanInitializationInParallel: false",
         "tempRollingWindowSize: 12",
         "fanController:",
-        "  adjustmentTickRate: 1s",
+        "  adjustmentTickRate: 5s",
         "api:",
         "  enabled: true",
         "  host: 127.0.0.1",
@@ -888,10 +927,10 @@ def settings_path(raw: str):
     return path
 
 
-def helper_trusted() -> bool:
+def _helper_file_ok(path: Path) -> bool:
     """The root helper only. Never the copy in the writable plugin checkout."""
     try:
-        st = HELPER_INSTALLED.lstat()
+        st = path.lstat()
     except OSError:
         return False
     if not stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode):
@@ -899,6 +938,17 @@ def helper_trusted() -> bool:
     if st.st_uid != 0 or st.st_mode & 0o022:
         return False
     return True
+
+
+def installed_helper() -> Path | None:
+    for path in HELPER_CANDIDATES:
+        if _helper_file_ok(path):
+            return path
+    return None
+
+
+def helper_trusted() -> bool:
+    return installed_helper() is not None
 
 
 def system_fan2go() -> bool:
@@ -918,7 +968,8 @@ def system_fan2go() -> bool:
 
 
 def helper_bin():
-    return str(HELPER_INSTALLED) if helper_trusted() else ""
+    path = installed_helper()
+    return str(path) if path else ""
 
 
 def pkexec_helper(*args):
@@ -1221,6 +1272,14 @@ class OmaFlow:
         self._last_lcd_push = 0.0
         self._lcd_busy = False
         self._last_pwm = {}
+        self._pwm_attempt = {}
+        self._pwm_attempt_at = {}
+        self._trace_s = 0
+        self._trace_until = 0.0
+        self._trace_next = 0.0
+        self._next_poll = 0.0
+        self._wake = threading.Event()
+        self._held_temp = {}
         self._last_gpu_duty = None
         self._last_pump_duty = None
         self._last_aio_duty = None
@@ -1352,17 +1411,15 @@ class OmaFlow:
             coolant = self.aio["coolant"]
 
         self.temps = {
-            "cpu": cpu if cpu is not None else asusec_cpu,
-            "cpuCcd1": ccd1,
-            "cpuCcd2": ccd2,
-            "gpu": gpu,
-            "coolant": coolant,
-            "motherboard": mb,
-            "vrm": vrm,
+            "cpu": whole_degree(cpu if cpu is not None else asusec_cpu),
+            "cpuCcd1": whole_degree(ccd1),
+            "cpuCcd2": whole_degree(ccd2),
+            "gpu": whole_degree(gpu),
+            "coolant": whole_degree(coolant),
+            "motherboard": whole_degree(mb),
+            "vrm": whole_degree(vrm),
         }
-        for key in ("cpu", "gpu", "coolant"):
-            v = self.temps.get(key)
-            self.history[key].append(None if v is None else round(float(v), 1))
+        self._sample_trace(time.time())
         self.maybe_refresh_lcd()
 
         fans = []
@@ -1373,6 +1430,7 @@ class OmaFlow:
             for fan in chip["fans"]:
                 rpm = read_int(Path(fan["rpm_path"]))
                 pwm = read_int(Path(fan["pwm_path"])) if fan["has_pwm"] else None
+                enable = read_int(Path(fan["enable_path"])) if fan.get("enable_path") else None
                 duty = None if pwm is None else round(pwm * 100.0 / 255.0, 1)
                 label = fan["label"]
                 item_kind = kind
@@ -1392,6 +1450,7 @@ class OmaFlow:
                     "channel": fan["index"],
                     "rpm": rpm,
                     "pwm": pwm,
+                    "enable": enable,
                     "duty": duty,
                 })
         if self.nvidia:
@@ -1435,7 +1494,7 @@ class OmaFlow:
     def tick_gpu(self) -> None:
         if not self.state.get("gpuControl"):
             return
-        gpu = self.temps.get("gpu")
+        gpu = self.held_temp("gpu", self.temps.get("gpu"))
         if gpu is None:
             return
         mode = self.state["mode"]
@@ -1472,7 +1531,7 @@ class OmaFlow:
             return False
         if self.sensor_of(channel) != "cpu":
             return True
-        temp = self._temp_for(channel)
+        temp = self.held_temp(channel, self._temp_for(channel))
         if temp is None:
             return False
         points, temps = self.active_curve(self.state["mode"], channel)
@@ -1503,21 +1562,53 @@ class OmaFlow:
             return True
         return self.tick_fixed("aio", "_last_aio_duty", 3, 0)
 
+    def held_temp(self, key: str, temp, band: int = 3):
+        """Keep the last control temperature until the sensor moves by band °C.
+        Tctl flickers enough to walk a fan curve on its own."""
+        if temp is None:
+            return None
+        current = int(temp)
+        last = self._held_temp.get(key)
+        if last is not None and abs(current - int(last)) < band:
+            return int(last)
+        self._held_temp[key] = current
+        return current
+
     def _write_kind(self, kind: str, duty: float) -> None:
         pwm = int(round(clamp(duty, 0, 100) * 255 / 100.0))
+        now = time.time()
         for fan in self.fans:
             if fan.get("kind") != kind or not fan.get("hwmon") or not fan.get("channel"):
                 continue
-            key = f"{fan['hwmon']}:{fan['channel']}"
-            last = self._last_pwm.get(key)
-            if last is not None and abs(pwm - last) < 8:
+            channel = int(fan["channel"])
+            key = f"{fan['hwmon']}:{channel}"
+            attempt_at = self._pwm_attempt_at.get(key)
+            since = None if attempt_at is None else now - attempt_at
+            # enable 0 means this header did not stay in manual mode. The pwm
+            # number is then not a duty we set, and retrying it every poll
+            # just forks another root command.
+            manual = fan.get("enable")
+            if manual == 0 and since is not None and since < PWM_RETRY_S:
                 continue
-            if write_pwm_user_or_helper(fan["hwmon"], fan["channel"], pwm, True):
+            current = None if manual == 0 else fan.get("pwm")
+            if not pwm_should_write(
+                pwm,
+                self._last_pwm.get(key),
+                current,
+                self._pwm_attempt.get(key),
+                since,
+            ):
+                if current is not None and abs(pwm - int(current)) < PWM_HYSTERESIS:
+                    self._last_pwm[key] = int(current)
+                continue
+            self._pwm_attempt[key] = pwm
+            self._pwm_attempt_at[key] = now
+            if write_pwm_user_or_helper(fan["hwmon"], channel, pwm, True):
                 self._last_pwm[key] = pwm
 
     def tick_control(self) -> None:
         mode = self.state["mode"]
-        cpu = self.temps.get("cpu")
+        cpu = self.held_temp("chassis", self.temps.get("cpu"))
         if cpu is not None and self.state.get("chassisControl", True) is not False:
             duty = duty_at(self.state["curves"][mode]["chassis"], cpu, CPU_TEMPS)
             if mode != "silent":
@@ -1525,7 +1616,7 @@ class OmaFlow:
             self._write_kind("chassis", duty)
         if self.state.get("cpuControl"):
             points, temps = self.active_curve(mode, "cpu")
-            source = self._temp_for("cpu")
+            source = self.held_temp("cpu", self._temp_for("cpu"))
             if source is not None:
                 cpu_duty = duty_at(points, source, temps)
                 if mode != "silent":
@@ -1533,7 +1624,7 @@ class OmaFlow:
                 self._write_kind("cpu", cpu_duty)
         if self.state.get("pumpControl", True) is not False and not (self._usb_pump or self.aio):
             points, temps = self.active_curve(mode, "pump")
-            source = self._temp_for("pump")
+            source = self.held_temp("header-pump", self._temp_for("pump"))
             if source is not None:
                 pump_duty = max(PUMP_MIN, duty_at(points, source, temps))
                 self._write_kind("header-pump", pump_duty)
@@ -1640,9 +1731,9 @@ class OmaFlow:
         punch = lcd_hex(accent)
         coolant = None
         if self.temps.get("coolant") is not None:
-            coolant = round(float(self.temps["coolant"]), 1)
+            coolant = whole_degree(self.temps["coolant"])
         elif self.aio and self.aio.get("coolant") is not None:
-            coolant = round(float(self.aio["coolant"]), 1)
+            coolant = whole_degree(self.aio["coolant"])
         key = (mode, bool(self.state.get("themeSync")), punch, brightness, coolant)
         if mode == "off":
             write_solid_png(LCD_PNG, "#000000")
@@ -1677,10 +1768,10 @@ class OmaFlow:
             return
         if self.state.get("lcdMode") != "liquid" or not self.state.get("themeSync"):
             return
-        if time.time() - self._last_lcd_push < 4:
+        if time.time() - self._last_lcd_push < POLL_S:
             return
         coolant = self.temps.get("coolant")
-        t = None if coolant is None else round(float(coolant), 1)
+        t = whole_degree(coolant)
         accent = resolve_accent(self.state.get("accent") or "")
         punch = lcd_hex(accent)
         key = ("liquid", True, punch, int(self.state.get("lcdBrightness") or 80), t)
@@ -1698,6 +1789,98 @@ class OmaFlow:
                 self._lcd_busy = False
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _stop_trace(self) -> None:
+        self._trace_s = 0
+        self._trace_until = 0.0
+        self._trace_next = 0.0
+        for key in self.history:
+            self.history[key].clear()
+
+    def set_trace(self, interval) -> None:
+        try:
+            seconds = int(interval)
+        except (TypeError, ValueError):
+            seconds = 0
+        if seconds not in TRACE_INTERVALS:
+            self._stop_trace()
+            return
+        now = time.time()
+        for key in self.history:
+            self.history[key].clear()
+        self._trace_s = seconds
+        self._trace_until = now + TRACE_WINDOW_S
+        self._trace_next = now
+        if self.temps:
+            self._sample_trace(now)
+        self._wake.set()
+
+    def _sample_trace(self, now: float, temps=None) -> str:
+        """Record one point. Returns 'point', 'stop', or ''."""
+        if self._trace_s <= 0:
+            return ""
+        if now >= self._trace_until:
+            self._stop_trace()
+            return "stop"
+        if now < self._trace_next:
+            return ""
+        self._trace_next = now + self._trace_s
+        src = temps if temps is not None else self.temps
+        for key in ("cpu", "gpu", "coolant"):
+            value = src.get(key)
+            self.history[key].append(None if value is None else int(value))
+        return "point"
+
+    def _trace_reading(self) -> dict:
+        """CPU and coolant from hwmon. GPU stays on the last nvidia-smi sample."""
+        now = time.time()
+        if now - self._chips_at > 15 or not self._chips_cached:
+            self._chips_cached = hwmon_chips()
+            self._chips_at = now
+        cpu = whole_degree(find_temp(self._chips_cached, "k10temp", label_re=r"Tctl", index=1))
+        if cpu is None:
+            cpu = whole_degree(find_temp(self._chips_cached, "asusec", label_re=r"^CPU$"))
+        coolant = whole_degree(find_temp(self._chips_cached, "z53", index=1))
+        return {
+            "cpu": cpu if cpu is not None else self.temps.get("cpu"),
+            "gpu": self.temps.get("gpu"),
+            "coolant": coolant if coolant is not None else self.temps.get("coolant"),
+        }
+
+    def emit_trace(self) -> None:
+        emit({
+            "event": "trace",
+            "history": {key: list(values) for key, values in self.history.items()},
+            "trace": {
+                "interval": self._trace_s,
+                "until": self._trace_until if self._trace_s else 0,
+            },
+        })
+
+    def trace_tick(self) -> None:
+        """Graph sample only. No nvidia-smi, liquidctl, or fan command."""
+        before = self._trace_s
+        outcome = self._sample_trace(time.time(), self._trace_reading())
+        if outcome == "point" or self._trace_s != before:
+            self.emit_trace()
+
+    def seconds_until_due(self) -> float:
+        now = time.time()
+        wait = self._next_poll - now
+        if self._trace_s > 0:
+            wait = min(wait, self._trace_next - now)
+        return max(0.0, wait)
+
+    def run_due(self) -> None:
+        now = time.time()
+        polled = False
+        if now >= self._next_poll - 0.05:
+            self._next_poll = now + POLL_S
+            self.poll()
+            self.emit_state(telemetry=True)
+            polled = True
+        if self._trace_s and now >= self._trace_next - 0.05 and not polled:
+            self.trace_tick()
 
     def schedule_apply(self) -> None:
         if self._apply_timer is not None:
@@ -1782,6 +1965,10 @@ class OmaFlow:
             "error": self.last_error,
             "applyError": self.apply_error,
             "curveRev": self._curve_rev,
+            "trace": {
+                "interval": self._trace_s,
+                "until": self._trace_until if self._trace_s else 0,
+            },
         }
         if not telemetry:
             payload["curves"] = self.state["curves"]
@@ -1904,9 +2091,14 @@ class OmaFlow:
         op = msg.get("op")
         if op == "quit":
             self._stop.set()
+            self._wake.set()
             return
         if op == "refresh":
             self.poll()
+            self.emit_state()
+            return
+        if op == "set_trace":
+            self.set_trace(msg.get("interval"))
             self.emit_state()
             return
         if op == "set_mode":
@@ -2107,12 +2299,17 @@ def main() -> None:
 
     t = threading.Thread(target=stdin_loop, args=(app,), daemon=True)
     t.start()
+    app._next_poll = time.time() + POLL_S
     while not app._stop.is_set():
-        time.sleep(POLL_S)
+        with app.lock:
+            delay = app.seconds_until_due()
+        app._wake.wait(timeout=delay)
+        app._wake.clear()
+        if app._stop.is_set():
+            break
         with app.lock:
             try:
-                app.poll()
-                app.emit_state(telemetry=True)
+                app.run_due()
             except Exception:
                 log(traceback.format_exc())
 
